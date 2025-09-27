@@ -1,38 +1,340 @@
--- DROP SCHEMA _wh;
+-- =============================================================================
+-- WAREHOUSE FUNCTIONS
+-- =============================================================================
+-- This file contains all warehouse management functions.
+-- Run this script after initial database setup with create.sql
 
-CREATE SCHEMA _wh AUTHORIZATION postgres;
--- _wh.tenant_connections definition
+-- =============================================================================
+-- GENERIC TEMPLATE-BASED FUNCTIONS
+-- =============================================================================
 
--- Drop table
-
--- DROP TABLE _wh.tenant_connections;
-
-CREATE TABLE _wh.tenant_connections (
-	tenant_name text NOT NULL,
-	host text NOT NULL,
-	port int4 DEFAULT 5432 NULL,
-	dbname text NOT NULL,
-	username text NOT NULL,
-	"password" text NOT NULL,
-	created_at timestamp DEFAULT now() NULL,
-	updated_at timestamp DEFAULT now() NULL,
-	CONSTRAINT tenant_connections_pkey PRIMARY KEY (tenant_name)
-);
-
--- Permissions
-
-ALTER TABLE _wh.tenant_connections OWNER TO postgres;
-GRANT ALL ON TABLE _wh.tenant_connections TO postgres;
-GRANT ALL ON TABLE _wh.tenant_connections TO whadmin;
-
-
-
--- DROP FUNCTION _wh.create_foodlogstats_mv(text, text, text, date, text);
-
-CREATE OR REPLACE FUNCTION _wh.create_foodlogstats_mv(tenant_connection_name text, target_schema text, base_view_name text, target_date date, client_name text DEFAULT NULL::text)
- RETURNS boolean
- LANGUAGE plpgsql
+-- Generic materialized view creation from template
+CREATE OR REPLACE FUNCTION _wh.create_mv_from_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    target_date date,
+    client_name text DEFAULT NULL::text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
 AS $function$
+DECLARE
+    connection_string TEXT;
+    template_data RECORD;
+    remote_query TEXT;
+    view_name TEXT;
+    full_mv_name TEXT;
+    client_override TEXT;
+    create_sql TEXT;
+    context JSONB;
+BEGIN
+    -- Generate the full view name internally
+    view_name := _wh.create_mv_name(template_name, target_date);
+
+    -- Setup context for logging
+    context := jsonb_build_object(
+        'template', template_name,
+        'tenant', tenant_connection_name,
+        'schema', target_schema,
+        'view_name', view_name,
+        'target_date', target_date
+    );
+
+    -- Get template data
+    BEGIN
+        SELECT * INTO template_data
+        FROM _wh.mv_templates
+        WHERE mv_templates.template_name = create_mv_from_template.template_name;
+
+        IF NOT FOUND THEN
+            PERFORM _wh.log_error('Template not found: ' || template_name, context);
+            RETURN FALSE;
+        END IF;
+
+        PERFORM _wh.log_debug('Found template: ' || template_name, context);
+    EXCEPTION
+        WHEN OTHERS THEN
+            PERFORM _wh.log_error('Failed to get template: ' || template_name || ' - ' || SQLERRM, context);
+            RETURN FALSE;
+    END;
+
+    -- Get connection string
+    BEGIN
+        connection_string := _wh.get_tenant_connection_string(tenant_connection_name);
+        PERFORM _wh.log_debug('Got connection string for tenant: ' || tenant_connection_name, context);
+    EXCEPTION
+        WHEN OTHERS THEN
+            PERFORM _wh.log_error('Failed to get connection string for tenant: ' || tenant_connection_name || ' - ' || SQLERRM, context);
+            RETURN FALSE;
+    END;
+
+    full_mv_name := target_schema || '.' || view_name;
+
+    -- Use client_name if provided, otherwise use target_schema
+    client_override := COALESCE(client_name, target_schema);
+
+    PERFORM _wh.log_info('Creating MV: ' || full_mv_name || ' for date: ' || target_date || ' client: ' || client_override, context);
+
+    -- Substitute placeholders in template query
+    remote_query := template_data.query_template;
+    remote_query := replace(remote_query, '{CLIENT_NAME}', client_override);
+    remote_query := replace(remote_query, '{TARGET_DATE}', target_date::text);
+
+    -- Check if MV already exists
+    IF _wh.does_mv_exist(target_schema, view_name) THEN
+        PERFORM _wh.log_info('MV already exists, skipping: ' || full_mv_name, context);
+        RETURN TRUE;
+    END IF;
+
+    -- Create the materialized view using dblink
+    create_sql := format(
+        'CREATE MATERIALIZED VIEW %I.%I AS SELECT * FROM dblink(%L, %L) AS t(%s)',
+        target_schema,
+        view_name,
+        connection_string,
+        remote_query,
+        template_data.column_definitions
+    );
+
+    BEGIN
+        EXECUTE create_sql;
+        PERFORM _wh.log_info('Successfully created MV: ' || full_mv_name, context);
+
+        -- Set ownership to whadmin
+        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO whadmin', target_schema, view_name);
+
+        -- Grant public select access
+        EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, view_name);
+
+        -- Create indexes if defined
+        IF template_data.indexes IS NOT NULL AND length(trim(template_data.indexes)) > 0 THEN
+            DECLARE
+                index_sql TEXT;
+            BEGIN
+                index_sql := template_data.indexes;
+                index_sql := replace(index_sql, '{SCHEMA}', target_schema);
+                index_sql := replace(index_sql, '{VIEW_NAME}', view_name);
+
+                EXECUTE index_sql;
+                PERFORM _wh.log_debug('Created indexes for MV: ' || full_mv_name, context);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    PERFORM _wh.log_error('Failed to create indexes for MV: ' || full_mv_name || ' - ' || SQLERRM, context);
+                    -- Don't fail the entire operation for index creation issues
+            END;
+        END IF;
+
+        RETURN TRUE;
+    EXCEPTION
+        WHEN OTHERS THEN
+            PERFORM _wh.log_error('Failed to create MV: ' || full_mv_name || ' - ' || SQLERRM, context);
+            RETURN FALSE;
+    END;
+END;
+$function$;
+
+-- Grant execute permission to whadmin only
+GRANT EXECUTE ON FUNCTION _wh.create_mv_from_template(text, text, text, date, text) TO whadmin;
+
+-- Generic materialized view update from template
+CREATE OR REPLACE FUNCTION _wh.update_mv_by_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    target_date date,
+    allow_refresh_yesterday boolean DEFAULT true,
+    client_name text DEFAULT NULL::text
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    context JSONB;
+    view_name TEXT;
+    full_mv_name TEXT;
+    yesterday_date DATE;
+    refresh_result BOOLEAN;
+BEGIN
+    -- Generate the full view name internally
+    view_name := _wh.create_mv_name(template_name, target_date);
+    full_mv_name := target_schema || '.' || view_name;
+
+    -- Setup context for logging
+    context := jsonb_build_object(
+        'template', template_name,
+        'tenant', tenant_connection_name,
+        'schema', target_schema,
+        'view_name', view_name,
+        'target_date', target_date,
+        'allow_refresh_yesterday', allow_refresh_yesterday
+    );
+
+    PERFORM _wh.log_info('Starting MV update for template: ' || template_name || ' date: ' || target_date, context);
+
+    -- Create or refresh the MV for target_date
+    IF _wh.does_mv_exist(target_schema, view_name) THEN
+        PERFORM _wh.log_info('MV exists, refreshing: ' || full_mv_name, context);
+        refresh_result := _wh.refresh_mv(target_schema, view_name);
+        IF NOT refresh_result THEN
+            PERFORM _wh.log_error('Failed to refresh MV: ' || full_mv_name, context);
+            RETURN FALSE;
+        END IF;
+    ELSE
+        PERFORM _wh.log_info('MV does not exist, creating: ' || full_mv_name, context);
+        refresh_result := _wh.create_mv_from_template(template_name, tenant_connection_name, target_schema, target_date, client_name);
+        IF NOT refresh_result THEN
+            PERFORM _wh.log_error('Failed to create MV: ' || full_mv_name, context);
+            RETURN FALSE;
+        END IF;
+    END IF;
+
+    -- Also refresh yesterday if allowed and today is the target date
+    IF allow_refresh_yesterday AND target_date = CURRENT_DATE THEN
+        yesterday_date := target_date - INTERVAL '1 day';
+        DECLARE
+            yesterday_view_name TEXT;
+            yesterday_full_mv_name TEXT;
+            yesterday_context JSONB;
+        BEGIN
+            yesterday_view_name := _wh.create_mv_name(template_name, yesterday_date);
+            yesterday_full_mv_name := target_schema || '.' || yesterday_view_name;
+
+            yesterday_context := jsonb_build_object(
+                'template', template_name,
+                'tenant', tenant_connection_name,
+                'schema', target_schema,
+                'view_name', yesterday_view_name,
+                'target_date', yesterday_date,
+                'parent_operation', 'refresh_yesterday'
+            );
+
+            IF _wh.does_mv_exist(target_schema, yesterday_view_name) THEN
+                PERFORM _wh.log_info('Also refreshing yesterday MV: ' || yesterday_full_mv_name, yesterday_context);
+                refresh_result := _wh.refresh_mv(target_schema, yesterday_view_name);
+                IF NOT refresh_result THEN
+                    PERFORM _wh.log_error('Failed to refresh yesterday MV: ' || yesterday_full_mv_name, yesterday_context);
+                    -- Don't fail the main operation for yesterday refresh issues
+                END IF;
+            ELSE
+                PERFORM _wh.log_debug('Yesterday MV does not exist, skipping refresh: ' || yesterday_full_mv_name, yesterday_context);
+            END IF;
+        END;
+    END IF;
+
+    PERFORM _wh.log_info('Successfully completed MV update for template: ' || template_name || ' date: ' || target_date, context);
+    RETURN TRUE;
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM _wh.log_error('Error in update_mv_by_template: ' || SQLERRM, context);
+        RETURN FALSE;
+END;
+$function$;
+
+-- Grant execute permission to whadmin only
+GRANT EXECUTE ON FUNCTION _wh.update_mv_by_template(text, text, text, date, boolean, text) TO whadmin;
+
+-- =============================================================================
+-- TEMPLATE MANAGEMENT
+-- =============================================================================
+-- Templates are managed via direct SQL INSERT/UPDATE on _wh.mv_templates table
+-- Use DBeaver or similar tools to view/edit template data
+
+-- Template-based bulk update function
+CREATE OR REPLACE FUNCTION _wh.update_mv_window_by_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    start_date date,
+    end_date date,
+    client_name text DEFAULT NULL
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    loop_date DATE;
+    date_results JSONB := '[]';
+    success_count INTEGER := 0;
+    error_count INTEGER := 0;
+    start_time TIMESTAMP := NOW();
+    date_result BOOLEAN;
+    date_info JSONB;
+BEGIN
+    -- Validate date range
+    IF start_date > end_date THEN
+        RAISE EXCEPTION 'start_date (%) cannot be greater than end_date (%)', start_date, end_date;
+    END IF;
+
+    -- Validate template exists
+    IF NOT EXISTS (SELECT 1 FROM _wh.mv_templates WHERE mv_templates.template_name = update_mv_window_by_template.template_name) THEN
+        RAISE EXCEPTION 'Template not found: %', template_name;
+    END IF;
+
+    -- Loop through each date in the range (inclusive)
+    loop_date := start_date;
+    WHILE loop_date <= end_date LOOP
+        -- Call template-based function with allow_refresh_yesterday=false
+        date_result := _wh.update_mv_by_template(
+            template_name,
+            tenant_connection_name,
+            target_schema,
+            loop_date,
+            false,  -- allow_refresh_yesterday=false for bulk operations
+            client_name
+        );
+
+        -- Track results
+        date_info := jsonb_build_object(
+            'date', loop_date,
+            'success', date_result
+        );
+        date_results := date_results || date_info;
+
+        IF date_result THEN
+            success_count := success_count + 1;
+        ELSE
+            error_count := error_count + 1;
+        END IF;
+
+        -- Move to next date
+        loop_date := loop_date + INTERVAL '1 day';
+    END LOOP;
+
+    -- Return summary
+    RETURN jsonb_build_object(
+        'template_name', template_name,
+        'tenant', tenant_connection_name,
+        'schema', target_schema,
+        'start_date', start_date,
+        'end_date', end_date,
+        'total_dates', success_count + error_count,
+        'success_count', success_count,
+        'error_count', error_count,
+        'duration_seconds', EXTRACT(EPOCH FROM (NOW() - start_time)),
+        'date_results', date_results
+    );
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'error', SQLERRM,
+            'success', false,
+            'template_name', template_name,
+            'tenant', tenant_connection_name,
+            'schema', target_schema
+        );
+END;
+$function$;
+
+-- Grant execute permission to whadmin only
+GRANT EXECUTE ON FUNCTION _wh.update_mv_window_by_template(text, text, text, date, date, text) TO whadmin;
+
+-- =============================================================================
+-- UTILITY FUNCTIONS
+-- =============================================================================
   DECLARE
       connection_string TEXT;
       remote_query TEXT;
@@ -650,9 +952,9 @@ AS $function$
 ALTER FUNCTION _wh.update_mv_window(text, text, date, date, text) OWNER TO postgres;
 GRANT EXECUTE ON FUNCTION _wh.update_mv_window(text, text, date, date, text) TO whadmin;
 
--- DROP FUNCTION _wh.update_tenant_view(text, text, text);
+-- DROP FUNCTION _wh.update_tenant_union_view(text, text, text);
 
-CREATE OR REPLACE FUNCTION _wh.update_tenant_view(tenant_connection_name text, target_schema text, view_basename text)
+CREATE OR REPLACE FUNCTION _wh.update_tenant_union_view(tenant_connection_name text, target_schema text, view_basename text)
  RETURNS jsonb
  LANGUAGE plpgsql
 AS $function$
@@ -745,8 +1047,8 @@ AS $function$
 
 -- Permissions
 
-ALTER FUNCTION _wh.update_tenant_view(text, text, text) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.update_tenant_view(text, text, text) TO whadmin;
+ALTER FUNCTION _wh.update_tenant_union_view(text, text, text) OWNER TO postgres;
+GRANT EXECUTE ON FUNCTION _wh.update_tenant_union_view(text, text, text) TO whadmin;
 
 
 -- Schema-level permissions

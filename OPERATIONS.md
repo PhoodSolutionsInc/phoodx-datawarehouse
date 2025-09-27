@@ -10,7 +10,8 @@ This guide covers day-to-day operational procedures for the PostgreSQL-based dat
 - [Re-creating a Single Materialized View](#re-creating-a-single-materialized-view)
 - [Re-creating an Entire Tenant Dataset](#re-creating-an-entire-tenant-dataset)
 - [Connecting to the DataWarehouse for Reports](#connecting-to-the-datawarehouse-for-reports)
-- [Adding a New Type of DataTable/MV](#adding-a-new-type-of-datatablemv)
+- [Adding a New Template](#adding-a-new-template)
+- [Adding a New Type of DataTable/MV (Legacy)](#adding-a-new-type-of-datatablemv-legacy)
 - [Managing Cron Jobs](#managing-cron-jobs)
 - [Troubleshooting](#troubleshooting)
 - [Monitoring and Health Checks](#monitoring-and-health-checks)
@@ -37,13 +38,16 @@ psql -h your-warehouse.rds.amazonaws.com -U postgres -d template1
 
 ```sql
 -- Run the initial setup script
-\i create.sql
+\i sql/create.sql
 
--- Connect to the new warehouse database
-\c phood_warehouse
+-- Connect to the new warehouse database as whadmin
+\c phood_warehouse whadmin
 
--- Create the _wh schema and all functions
-\i _wh-ddl.sql
+-- Create all warehouse functions
+\i sql/functions.sql
+
+-- Load the foodlogstats template
+\i sql/template-foodlogstats.sql
 ```
 
 This will:
@@ -122,8 +126,9 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA new_tenant_name GRANT SELECT ON TABLES TO pho
 
 ### Step 2: Add Tenant Connection
 ```sql
--- Add connection details to tenant_connections table
-SELECT _wh.set_tenant_connection(
+-- Add connection details to tenant_connections table (direct SQL)
+INSERT INTO _wh.tenant_connections (tenant_name, host, port, dbname, username, password)
+VALUES (
     'new_tenant_connection_name',     -- connection identifier
     'tenant-db.rds.amazonaws.com',    -- host
     5432,                             -- port
@@ -145,31 +150,35 @@ SELECT * FROM dblink(
 ) AS t(test integer);
 ```
 
-### Step 4: Initial Data Load
+### Step 4: Initial Data Load (Template-Based)
 ```sql
 -- Connect as whadmin user for data operations
 -- Create first materialized view (current date)
-SELECT _wh.update_foodlogstats(
-    'new_tenant_connection_name',
-    'new_tenant_name',
+SELECT _wh.update_mv_by_template(
+    'foodlogstats',                   -- template name
+    'new_tenant_connection_name',     -- connection name
+    'new_tenant_name',               -- schema name
     CURRENT_DATE
 );
 
 -- Backfill historical data (one month at a time)
-SELECT _wh.update_mv_window(
-    'new_tenant_connection_name',
-    'new_tenant_name',
+SELECT _wh.update_mv_window_by_template(
+    'foodlogstats',                   -- template name
+    'new_tenant_connection_name',     -- connection name
+    'new_tenant_name',               -- schema name
     '2024-01-01'::date,
-    '2024-01-31'::date,
-    '_wh.update_foodlogstats'
+    '2024-01-31'::date
 );
 
 -- Create unified tenant view
-SELECT _wh.update_tenant_view(
-    'new_tenant_connection_name',
-    'new_tenant_name',
-    'foodlogstats'
+SELECT _wh.update_tenant_union_view_by_template(
+    'foodlogstats',                   -- template name
+    'new_tenant_connection_name',     -- connection name
+    'new_tenant_name'                -- schema name
 );
+
+-- Update public master view to include new tenant
+SELECT _wh.update_public_view_by_template('foodlogstats');
 ```
 
 ### Step 5: Update Master Cross-Tenant View
@@ -384,7 +393,88 @@ Supported tools:
 
 ---
 
-## Adding a New Type of DataTable/MV
+## Adding a New Template
+
+Creating a new template allows you to define new types of materialized views without writing custom functions.
+
+### Step 1: Create Template SQL File
+Create a new file: `sql/template-{name}.sql`
+
+```sql
+-- Example: sql/template-inventory_stats.sql
+INSERT INTO _wh.mv_templates (
+    template_name,
+    description,
+    query_template,
+    column_definitions,
+    indexes
+) VALUES (
+    'inventory_stats',
+    'Daily inventory statistics with movement tracking',
+    $template$
+SELECT
+    i.id,
+    l.name AS location,
+    i.item_name,
+    i.current_stock,
+    i.movement_type,
+    i.quantity_change,
+    i.timestamp AS recorded_time
+FROM inventory_movements i
+LEFT JOIN locations l ON i.location_id = l.id
+WHERE i.timestamp::DATE = '{TARGET_DATE}'::DATE
+$template$,
+    $columns$
+id INTEGER,
+location TEXT,
+item_name TEXT,
+current_stock INTEGER,
+movement_type TEXT,
+quantity_change INTEGER,
+recorded_time TIMESTAMP
+$columns$,
+    'CREATE UNIQUE INDEX idx_{SCHEMA}_{VIEW_NAME}_id ON {SCHEMA}.{VIEW_NAME} (id);
+CREATE INDEX idx_{SCHEMA}_{VIEW_NAME}_recorded_time ON {SCHEMA}.{VIEW_NAME} (recorded_time);
+CREATE INDEX idx_{SCHEMA}_{VIEW_NAME}_location ON {SCHEMA}.{VIEW_NAME} (location);'
+);
+```
+
+### Step 2: Load Template
+```sql
+-- Connect as whadmin
+\c phood_warehouse whadmin
+
+-- Load the new template
+\i sql/template-inventory_stats.sql
+```
+
+### Step 3: Test Template
+```sql
+-- Create MV using new template
+SELECT _wh.create_mv_from_template('inventory_stats', 'tenant_a', 'reports', CURRENT_DATE);
+
+-- Create tenant union view
+SELECT _wh.update_tenant_union_view_by_template('inventory_stats', 'tenant_a', 'reports');
+
+-- Create public master view
+SELECT _wh.update_public_view_by_template('inventory_stats');
+```
+
+### Step 4: Template Management
+```sql
+-- View all templates
+SELECT template_name, description, created_at FROM _wh.mv_templates;
+
+-- View template details
+SELECT * FROM _wh.mv_templates WHERE template_name = 'inventory_stats';
+
+-- Update template (edit the .sql file and re-run it)
+-- Templates use ON CONFLICT DO UPDATE, so re-running updates safely
+```
+
+---
+
+## Adding a New Type of DataTable/MV (Legacy)
 
 ### Step 1: Create the Core MV Function
 ```sql

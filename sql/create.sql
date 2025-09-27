@@ -85,6 +85,43 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO phood_ro;
 -- CREATE COMMON SCHEMAS
 -- =============================================================================
 
+-- Create warehouse operational schema
+CREATE SCHEMA _wh AUTHORIZATION postgres;
+
+-- Create tenant connections table
+CREATE TABLE _wh.tenant_connections (
+	tenant_name text NOT NULL,
+	host text NOT NULL,
+	port int4 DEFAULT 5432 NULL,
+	dbname text NOT NULL,
+	username text NOT NULL,
+	"password" text NOT NULL,
+	created_at timestamp DEFAULT now() NULL,
+	updated_at timestamp DEFAULT now() NULL,
+	CONSTRAINT tenant_connections_pkey PRIMARY KEY (tenant_name)
+);
+
+-- Create materialized view templates table
+CREATE TABLE _wh.mv_templates (
+	template_name text NOT NULL,
+	description text,
+	query_template text NOT NULL,
+	column_definitions text NOT NULL,
+	indexes text,
+	created_at timestamp DEFAULT now() NULL,
+	updated_at timestamp DEFAULT now() NULL,
+	CONSTRAINT mv_templates_pkey PRIMARY KEY (template_name)
+);
+
+-- Set table ownership and permissions
+ALTER TABLE _wh.tenant_connections OWNER TO postgres;
+GRANT ALL ON TABLE _wh.tenant_connections TO postgres;
+GRANT ALL ON TABLE _wh.tenant_connections TO whadmin;
+
+ALTER TABLE _wh.mv_templates OWNER TO postgres;
+GRANT ALL ON TABLE _wh.mv_templates TO postgres;
+GRANT ALL ON TABLE _wh.mv_templates TO whadmin;
+
 -- =============================================================================
 -- SECURITY CLEANUP
 -- =============================================================================

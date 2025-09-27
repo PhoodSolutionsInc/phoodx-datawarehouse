@@ -1,4 +1,4 @@
-```markdown
+
 # Multi-Tenant Data Warehouse Architecture Summary
 
 ## 🎯 The Goal
@@ -8,20 +8,20 @@ Replace expensive Snowflake/BigQuery setup ($8k/month) with cost-effective Postg
 
 ### Schema Organization
 ```
-_wh                    # "Private" operational functions & config
+_wh/                   # "Private" operational functions & config
 ├── tenant_connections # Connection string management
-├── connection_audit   # Change tracking
+├── mv_templates       # Template-based MV definitions
 └── functions/         # All warehouse management functions
 
-public/                # User-facing master views
-├── foodstats
-├── summary views
+public/                # User-facing master views with schema context
+├── foodlogstats       # Master view with schema_name column
+├── summary views      # Future template-based views
 └── etc
 
-tenant_a/             # Individual tenant data
-├── foodstats_2025_09_24 # Daily materialized views
-├── foodstats_2025_09_25
-└── foodstats     # Tenant's unified view
+tenant_a/             # Individual tenant data (clean, no client column)
+├── foodlogstats_2025_09_24 # Daily materialized views
+├── foodlogstats_2025_09_25
+└── foodlogstats      # Tenant's unified view (pure UNION ALL)
 
 tenant_b/             # Repeat for each tenant
 tenant_c/
@@ -35,25 +35,25 @@ Source Tenant DBs → Read Replicas → Warehouse DB → Materialized Views → 
 
 ## 📊 Materialized View Strategy
 
-### Daily Pattern
-- **Daily MVs**: `tenant_a.foodlogstats_2025_09_24` (historical, immutable)
-- **Current Day MV**: Updated as needed via function calls
-- **Unified Views**: `tenant_a.foodlogstats` (UNION ALL of daily MVs)
-- **Master View**: `public.foodlogstats_all_tenants` (UNION ALL across tenants)
+### Template-Based Pattern
+- **Daily MVs**: `tenant_a.foodlogstats_2025_09_24` (clean data, date-only dependency)
+- **Current Day MV**: Updated as needed via template functions
+- **Tenant Union Views**: `tenant_a.foodlogstats` (pure UNION ALL of daily MVs)
+- **Public Master View**: `public.foodlogstats` (UNION ALL across tenants + schema_name column)
 
 ### Usage Examples
 ```sql
--- Update a single date for a tenant
-SELECT _wh.update_foodlogstats('tenant_a', 'reports', '2025-09-24'::date);
+-- Update a single date for a tenant (template-based)
+SELECT _wh.update_mv_by_template('foodlogstats', 'tenant_a', 'reports', '2025-09-24'::date);
 
 -- Update a date range for a tenant (bulk backfill)
-SELECT _wh.update_mv_window('tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date);
+SELECT _wh.update_mv_window_by_template('foodlogstats', 'tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date);
 
--- Create/update the unified view for a tenant
-SELECT _wh.update_tenant_view('tenant_a', 'reports', 'foodlogstats');
+-- Create/update the tenant union view
+SELECT _wh.update_tenant_union_view_by_template('foodlogstats', 'tenant_a', 'reports');
 
--- Force recreate all MVs in a date range
-SELECT _wh.update_mv_window('tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date, true);
+-- Create/update the public master view (all tenants)
+SELECT _wh.update_public_view_by_template('foodlogstats');
 ```
 
 ## 🔌 Remote Connection Management
@@ -127,25 +127,24 @@ SELECT * FROM dblink(
 - **Cold data** (6+ months): Cheaper storage or separate archive instance
 - **Estimated savings**: $200-400/month on storage costs
 
-## 🔧 Operational Functions
+## 🔧 Template-Based Functions
 
-### Core Management Functions
+### Core Template Functions
 ```sql
+-- Generic materialized view creation from templates
+_wh.create_mv_from_template(template_name, tenant_connection_name, target_schema, target_date)
 
--- Core materialized view creation.  Dedicated primary function for each type of warehouse MV.  There needs to be a singular primary CREATE function for each warehouse primary table we want to be able to crate.
-_wh.create_foodlogstats_mv(tenant_connection_name, target_schema, base_view_name, target_date, client_name)
+-- Single date operations using templates
+_wh.update_mv_by_template(template_name, tenant_connection_name, target_schema, target_date, allow_refresh_yesterday)
 
--- Single date operations. A wrapper around the primary create function.  These are used in the cron jobs.
-_wh.update_foodlogstats(tenant_connection_name, target_schema, target_date, allow_refresh_yesterday, force_recreate)
+-- Date range operations using templates
+_wh.update_mv_window_by_template(template_name, tenant_connection_name, target_schema, start_date, end_date)
 
--- Date range operations (generic function)
-_wh.update_mv_window(tenant_connection_name, target_schema, start_date, end_date, force_recreate, update_function_name)
+-- Union view management using templates
+_wh.update_tenant_union_view_by_template(template_name, tenant_connection_name, target_schema)
+_wh.update_public_view_by_template(template_name)
 
--- Union view management
-_wh.update_tenant_view(tenant_connection_name, target_schema, view_basename)
-
--- Connection management
-_wh.set_tenant_connection(name, host, port, dbname, username, password)
+-- Connection management (direct SQL on _wh.tenant_connections)
 _wh.get_tenant_connection_string(tenant_name)
 
 -- Utility functions
@@ -156,18 +155,25 @@ _wh.create_mv_name(mvname, target_date)
 
 ### Typical Workflow
 ```sql
--- 1. Set up tenant connection
-SELECT _wh.set_tenant_connection('tenant_a', 'db.example.com', 5432, 'production', 'readonly_user', 'password123');
+-- 1. Set up tenant connection (direct SQL)
+INSERT INTO _wh.tenant_connections (tenant_name, host, port, dbname, username, password)
+VALUES ('tenant_a', 'db.example.com', 5432, 'production', 'readonly_user', 'password123');
 
--- 2. Backfill historical data (one month at a time to avoid timeouts)
-SELECT _wh.update_mv_window('tenant_a', 'reports', '2025-08-01'::date, '2025-08-31'::date);
-SELECT _wh.update_mv_window('tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date);
+-- 2. Load template (if not already loaded)
+\i sql/template-foodlogstats.sql
 
--- 3. Create the unified view
-SELECT _wh.update_tenant_view('tenant_a', 'reports', 'foodlogstats');
+-- 3. Backfill historical data (one month at a time to avoid timeouts)
+SELECT _wh.update_mv_window_by_template('foodlogstats', 'tenant_a', 'reports', '2025-08-01'::date, '2025-08-31'::date);
+SELECT _wh.update_mv_window_by_template('foodlogstats', 'tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date);
 
--- 4. Daily operations: update current day
-SELECT _wh.update_foodlogstats('tenant_a', 'reports', CURRENT_DATE);
+-- 4. Create the tenant union view
+SELECT _wh.update_tenant_union_view_by_template('foodlogstats', 'tenant_a', 'reports');
+
+-- 5. Create/update the public master view
+SELECT _wh.update_public_view_by_template('foodlogstats');
+
+-- 6. Daily operations: update current day
+SELECT _wh.update_mv_by_template('foodlogstats', 'tenant_a', 'reports', CURRENT_DATE);
 ```
 
 ### Disaster Recovery
@@ -240,20 +246,75 @@ FROM pg_stat_database WHERE datname = 'warehouse';
 
 ## 🔒 Security & Access
 
-### Schema Permissions
-```sql
--- Lock down operational schema
-REVOKE ALL ON SCHEMA _wh FROM PUBLIC;
-GRANT USAGE ON SCHEMA _wh TO warehouse_admin;
+### User Roles & Responsibilities
 
--- Open public views for reporting
-GRANT USAGE ON SCHEMA public TO reporting_users;
+#### `postgres` (Master Admin)
+- **Purpose**: Database setup, user creation, and emergency access
+- **Access**: Full superuser privileges
+- **Usage**: Initial setup, schema creation, user management
+- **Security**: Highly restricted, used only for infrastructure changes
+
+#### `whadmin` (Warehouse Administrator)
+- **Purpose**: Day-to-day warehouse operations and data management
+- **Access**:
+  - Full access to `_wh` schema (functions, templates, connections)
+  - Create/manage tenant schemas and MVs
+  - Execute all warehouse functions
+- **Usage**: Data loading, MV management, operational tasks
+- **Security**: Cannot access other databases, limited to warehouse operations
+
+#### `phood_ro` (Read-Only BI User)
+- **Purpose**: Business intelligence, reporting, and analytics
+- **Access**:
+  - ✅ **CAN**: Read all MV data across tenant and public schemas
+  - ✅ **CAN**: View MV structure (columns, indexes, refresh times)
+  - ✅ **CAN**: See union view definitions
+  - ❌ **CANNOT**: Access `_wh` schema (connections, templates, functions)
+  - ❌ **CANNOT**: See source queries or connection strings
+  - ❌ **CANNOT**: View proprietary business logic in templates
+- **Usage**: BI tools, dashboards, ad-hoc analysis
+- **Security**: Complete isolation from operational data and credentials
+
+### Schema-Level Security
+```sql
+-- Operational schema (locked down)
+REVOKE ALL ON SCHEMA _wh FROM PUBLIC;
+GRANT USAGE ON SCHEMA _wh TO whadmin;
+
+-- Tenant schemas (read access for BI)
+GRANT USAGE ON SCHEMA tenant_a TO phood_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA tenant_a TO phood_ro;
+GRANT SELECT ON ALL MATERIALIZED VIEWS IN SCHEMA tenant_a TO phood_ro;
+
+-- Public master views (open for reporting)
+GRANT USAGE ON SCHEMA public TO phood_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO phood_ro;
 ```
+
+### Data Security Implications
+
+#### ✅ Protected Information
+- **Connection strings**: Hidden from BI users in `_wh.tenant_connections`
+- **Source queries**: Template business logic secured in `_wh.mv_templates`
+- **Operational functions**: Warehouse management code protected
+- **Cross-tenant isolation**: Users only see their authorized tenant data
+
+#### ✅ Transparent Information
+- **MV structure**: Column names and types visible for report building
+- **Data content**: Actual MV data accessible for analysis
+- **Refresh status**: MV metadata for operational visibility
+
+#### 🔒 Access Control Best Practices
+- Use connection pooling with `phood_ro` for BI tools
+- Rotate `whadmin` credentials regularly
+- Monitor query patterns for unusual activity
+- Consider row-level security for multi-tenant isolation if needed
 
 ### Connection Security
 - Encrypted passwords in connection table
 - SSL-only connections to RDS
 - Consider AWS Secrets Manager for production
+- Network isolation via VPC security groups
 
 ## 🚀 Implementation Path
 
@@ -294,4 +355,3 @@ pg_dump --schema=_wh warehouse_db > wh_infrastructure.sql
 ---
 
 This architecture leverages PostgreSQL's strengths while avoiding the complexity and cost of managed cloud data warehouses, perfect for cost-conscious organizations with engineering resources.
-```

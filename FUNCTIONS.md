@@ -1,33 +1,157 @@
 # Data Warehouse Functions Reference
 
-This document provides detailed reference for all `_wh` schema functions in the data warehouse.
+This document provides detailed reference for all `_wh` schema functions in the template-based data warehouse.
 
 ## Table of Contents
 
-- [Core Materialized View Functions](#core-materialized-view-functions)
-  - [_wh.create_foodlogstats_mv](#_whcreate_foodlogstats_mv)
-- [Wrapper Functions](#wrapper-functions)
-  - [_wh.update_foodlogstats](#_whupdate_foodlogstats)
-  - [_wh.update_mv_core](#_whupdate_mv_core)
-- [Batch Operations](#batch-operations)
-  - [_wh.update_mv_window](#_whupdate_mv_window)
-  - [_wh.update_tenant_view](#_whupdate_tenant_view)
+- [Template-Based Core Functions](#template-based-core-functions)
+  - [_wh.create_mv_from_template](#_whcreate_mv_from_template)
+  - [_wh.update_mv_by_template](#_whupdate_mv_by_template)
+  - [_wh.update_mv_window_by_template](#_whupdate_mv_window_by_template)
+- [Union View Functions](#union-view-functions)
+  - [_wh.update_tenant_union_view_by_template](#_whupdate_tenant_union_view_by_template)
+  - [_wh.update_public_view_by_template](#_whupdate_public_view_by_template)
 - [Connection Management](#connection-management)
-  - [_wh.set_tenant_connection](#_whset_tenant_connection)
   - [_wh.get_tenant_connection_string](#_whget_tenant_connection_string)
 - [Utility Functions](#utility-functions)
   - [_wh.create_mv_name](#_whcreate_mv_name)
   - [_wh.does_mv_exist](#_whdoes_mv_exist)
   - [_wh.refresh_mv](#_whrefresh_mv)
 - [Logging Functions](#logging-functions)
-  - [_wh.log](#_whlog)
-  - [_wh.log_info, _wh.log_warn, _wh.log_error, _wh.log_debug](#_whlog_helpers)
+  - [_wh.log_info, _wh.log_error, _wh.log_debug](#_whlog_helpers)
 
 ---
 
-## Core Materialized View Functions
+## Template-Based Core Functions
 
-### _wh.create_foodlogstats_mv
+### _wh.create_mv_from_template
+
+Creates a materialized view from a template definition.
+
+**Signature:**
+```sql
+_wh.create_mv_from_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    target_date date
+) RETURNS boolean
+```
+
+**Parameters:**
+- `template_name`: Name of the template in `_wh.mv_templates`
+- `tenant_connection_name`: Connection identifier from `_wh.tenant_connections`
+- `target_schema`: Schema to create the MV in
+- `target_date`: Date for the MV (substituted as `{TARGET_DATE}`)
+
+**Returns:** `TRUE` on success, `FALSE` on failure
+
+**Example:**
+```sql
+SELECT _wh.create_mv_from_template('foodlogstats', 'tenant_a', 'reports', '2025-09-24'::date);
+```
+
+### _wh.update_mv_by_template
+
+Updates or creates a materialized view using a template. If the MV exists, it refreshes; if not, it creates.
+
+**Signature:**
+```sql
+_wh.update_mv_by_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    target_date date,
+    allow_refresh_yesterday boolean DEFAULT true
+) RETURNS boolean
+```
+
+**Parameters:**
+- `template_name`: Name of the template in `_wh.mv_templates`
+- `tenant_connection_name`: Connection identifier
+- `target_schema`: Schema to update the MV in
+- `target_date`: Date for the MV
+- `allow_refresh_yesterday`: If true and target_date is today, also refresh yesterday's MV
+
+**Returns:** `TRUE` on success, `FALSE` on failure
+
+**Example:**
+```sql
+SELECT _wh.update_mv_by_template('foodlogstats', 'tenant_a', 'reports', CURRENT_DATE);
+```
+
+### _wh.update_mv_window_by_template
+
+Bulk updates materialized views for a date range using templates.
+
+**Signature:**
+```sql
+_wh.update_mv_window_by_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    start_date date,
+    end_date date
+) RETURNS jsonb
+```
+
+**Parameters:**
+- `template_name`: Name of the template
+- `tenant_connection_name`: Connection identifier
+- `target_schema`: Schema to update MVs in
+- `start_date`: Start date (inclusive)
+- `end_date`: End date (inclusive)
+
+**Returns:** JSON object with summary stats
+
+**Example:**
+```sql
+SELECT _wh.update_mv_window_by_template('foodlogstats', 'tenant_a', 'reports', '2025-09-01'::date, '2025-09-30'::date);
+```
+
+---
+
+## Union View Functions
+
+### _wh.update_tenant_union_view_by_template
+
+Creates or updates a tenant's union view that combines all daily MVs for a template.
+
+**Signature:**
+```sql
+_wh.update_tenant_union_view_by_template(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text
+) RETURNS boolean
+```
+
+**Creates:** `target_schema.template_name` view
+
+**Example:**
+```sql
+SELECT _wh.update_tenant_union_view_by_template('foodlogstats', 'tenant_a', 'reports');
+-- Creates: reports.foodlogstats
+```
+
+### _wh.update_public_view_by_template
+
+Creates or updates the public master view that combines all tenant union views with schema context.
+
+**Signature:**
+```sql
+_wh.update_public_view_by_template(
+    template_name text
+) RETURNS boolean
+```
+
+**Creates:** `public.template_name` view with `schema_name` column
+
+**Example:**
+```sql
+SELECT _wh.update_public_view_by_template('foodlogstats');
+-- Creates: public.foodlogstats (with schema_name column)
+```
 
 **Purpose**: Creates a single materialized view for food log statistics data for a specific date.
 
@@ -281,13 +405,13 @@ SELECT _wh.update_mv_window(
 }
 ```
 
-### _wh.update_tenant_view
+### _wh.update_tenant_union_view
 
 **Purpose**: Creates or updates a union view that combines all materialized views for a tenant.
 
 **Signature**:
 ```sql
-_wh.update_tenant_view(
+_wh.update_tenant_union_view(
     tenant_connection_name text,
     target_schema text,
     view_basename text
@@ -310,7 +434,7 @@ _wh.update_tenant_view(
 **Examples**:
 ```sql
 -- Create union view for all foodlogstats MVs
-SELECT _wh.update_tenant_view(
+SELECT _wh.update_tenant_union_view(
     'tenant_a_conn',
     'tenant_a',
     'foodlogstats'
