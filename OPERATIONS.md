@@ -25,11 +25,40 @@ This guide covers day-to-day operational procedures for the PostgreSQL-based dat
 - PostgreSQL RDS instance running
 - Master `postgres` user credentials
 - Network connectivity to tenant databases
+- **pg_cron extension enabled** (see setup instructions below)
+
+### pg_cron Extension Setup (Required)
+
+**IMPORTANT**: The pg_cron extension requires specific AWS RDS configuration and must be set up BEFORE running the database setup scripts.
+
+Follow the AWS documentation to enable pg_cron:
+https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_pg_cron.html#PostgreSQL_pg_cron.enable
+
+Key steps:
+1. **Parameter Group Configuration**: Create or modify your RDS parameter group to include:
+   - `shared_preload_libraries = 'pg_cron'`
+   - `cron.database_name = 'postgres'` (our default database)
+
+2. **Apply Parameter Group**: Attach the parameter group to your RDS instance
+
+3. **Restart Instance**: Reboot the RDS instance to load the extension
+
+4. **Create Extension**: After restart, connect as postgres user and run:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS pg_cron;
+   ```
+
+5. **Verify Setup**: Check that the extension is available:
+   ```sql
+   SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_cron';
+   ```
+
+**Note**: This setup process can take 10-15 minutes due to parameter group changes and instance restart requirements.
 
 ### Step 1: Initial Database and User Setup
 ```bash
-# Connect as master postgres user to template1 database
-psql -h your-warehouse.rds.amazonaws.com -U postgres -d template1
+# Connect as master postgres user to postgres database
+psql -h your-warehouse.rds.amazonaws.com -U postgres -d postgres
 ```
 
 **IMPORTANT**: Before running the script, edit `create.sql` and replace the password stubs:
@@ -40,8 +69,8 @@ psql -h your-warehouse.rds.amazonaws.com -U postgres -d template1
 -- Run the initial setup script
 \i sql/create.sql
 
--- Connect to the new warehouse database as whadmin
-\c phood_warehouse whadmin
+-- Stay connected to postgres database as whadmin
+\c postgres whadmin
 
 -- Create all warehouse functions
 \i sql/functions.sql
@@ -51,7 +80,7 @@ psql -h your-warehouse.rds.amazonaws.com -U postgres -d template1
 ```
 
 This will:
-- Rename the default database to `phood_warehouse`
+- Use the default `postgres` database (required for pg_cron)
 - Create required extensions (`dblink`, `pg_cron`)
 - Create `whadmin` user (warehouse operations)
 - Create `phood_ro` user (read-only BI access)

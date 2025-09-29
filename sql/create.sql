@@ -2,27 +2,29 @@
 --
 -- Prerequisites:
 -- 1. Connect to PostgreSQL as the master 'postgres' user
--- 2. Connect to the 'template1' database
+-- 2. Connect to the 'postgres' database (default database)
 -- 3. IMPORTANT: Update the password stubs below with actual secure passwords
 --
 -- Usage:
---   psql -h your-rds-endpoint.amazonaws.com -U postgres -d template1 -f create.sql
+--   psql -h your-rds-endpoint.amazonaws.com -U postgres -d postgres -f create.sql
 
 -- =============================================================================
 -- DATABASE SETUP
 -- =============================================================================
 
--- Rename default database to our warehouse name
-ALTER DATABASE postgres RENAME TO phood_warehouse;
+-- Using default 'postgres' database (required for pg_cron)
+-- No database renaming needed
 
 -- Create required extensions
-\c phood_warehouse postgres
+-- \c postgres postgres  -- Already connected to postgres database
 
 -- Create dblink extension (required for cross-database queries)
 CREATE EXTENSION IF NOT EXISTS dblink;
 
--- Create pg_cron extension (for scheduled jobs)
-CREATE EXTENSION IF NOT EXISTS pg_cron;
+-- NOTE: pg_cron setup requires specific AWS RDS configuration
+-- Follow AWS documentation before creating the extension:
+-- https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_pg_cron.html#PostgreSQL_pg_cron.enable
+-- CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- =============================================================================
 -- USER CREATION
@@ -55,14 +57,14 @@ COMMENT ON ROLE phood_ro IS 'Read-only access for BI tools, reporting, and analy
 -- =============================================================================
 
 -- Grant database connection privileges
-GRANT CONNECT ON DATABASE phood_warehouse TO whadmin;
-GRANT CONNECT ON DATABASE phood_warehouse TO phood_ro;
+GRANT CONNECT ON DATABASE postgres TO whadmin;
+GRANT CONNECT ON DATABASE postgres TO phood_ro;
 
 -- Grant schema creation privileges to whadmin (for tenant schemas)
-GRANT CREATE ON DATABASE phood_warehouse TO whadmin;
+GRANT CREATE ON DATABASE postgres TO whadmin;
 
 -- Grant temp tables for Materialized View updates
-GRANT TEMP ON DATABASE phood_warehouse TO whadmin;
+GRANT TEMP ON DATABASE postgres TO whadmin;
 
 
 
@@ -128,7 +130,7 @@ GRANT ALL ON TABLE _wh.mv_templates TO whadmin;
 
 -- Remove default public schema privileges from PUBLIC role
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-REVOKE ALL ON DATABASE phood_warehouse FROM PUBLIC;
+REVOKE ALL ON DATABASE postgres FROM PUBLIC;
 
 -- =============================================================================
 -- VERIFICATION QUERIES
@@ -155,19 +157,21 @@ FROM pg_extension
 WHERE extname IN ('dblink', 'pg_cron')
 ORDER BY extname;
 
+-- NOTE: pg_cron may not show up until AWS RDS parameter group is configured
+
 -- =============================================================================
 -- NEXT STEPS
 -- =============================================================================
 
 -- 1. Disconnect from postgres user
 -- 2. Connect as whadmin user:
---    psql -h your-rds-endpoint.amazonaws.com -U whadmin -d phood_warehouse
--- 3. Run the _wh-ddl.sql script to create warehouse schema and functions
--- 4. Begin adding tenant connections and schemas
+--    psql -h your-rds-endpoint.amazonaws.com -U whadmin -d postgres
+-- 3. Run the sql/functions.sql script to create warehouse schema and functions
+-- 4. Load templates and begin adding tenant connections and schemas
 
 NOTICE 'Database setup complete!';
 NOTICE 'Next steps:';
 NOTICE '1. Update password stubs with secure passwords';
-NOTICE '2. Reconnect as whadmin user';
-NOTICE '3. Run _wh-ddl.sql script';
-NOTICE '4. Begin tenant onboarding';
+NOTICE '2. Reconnect as whadmin user to postgres database';
+NOTICE '3. Run sql/functions.sql script';
+NOTICE '4. Load templates and begin tenant onboarding';

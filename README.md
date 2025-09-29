@@ -6,25 +6,33 @@ Replace expensive Snowflake/BigQuery setup ($8k/month) with cost-effective Postg
 
 ## 🏗️ Architecture Overview
 
+### Database Design Decision
+**Why we use the default `postgres` database:**
+- **pg_cron requirement**: The pg_cron extension expects the default `postgres` database to exist for job scheduling
+- **AWS RDS limitation**: Cannot easily modify postgresql.conf to change cron.database_name in managed RDS
+- **Simplicity**: Avoids database renaming complexity while maintaining all functionality
+- **Standard practice**: Many production PostgreSQL deployments use the default database for operational workloads
+
 ### Schema Organization
 ```
-_wh/                   # "Private" operational functions & config
-├── tenant_connections # Connection string management
-├── mv_templates       # Template-based MV definitions
-└── functions/         # All warehouse management functions
-
-public/                # User-facing master views with schema context
-├── foodlogstats       # Master view with schema_name column
-├── summary views      # Future template-based views
-└── etc
-
-tenant_a/             # Individual tenant data (clean, no client column)
-├── foodlogstats_2025_09_24 # Daily materialized views
-├── foodlogstats_2025_09_25
-└── foodlogstats      # Tenant's unified view (pure UNION ALL)
-
-tenant_b/             # Repeat for each tenant
-tenant_c/
+postgres (database)    # Default database (required for pg_cron)
+├── _wh/               # "Private" operational functions & config
+│   ├── tenant_connections # Connection string management
+│   ├── mv_templates   # Template-based MV definitions
+│   └── functions/     # All warehouse management functions
+│
+├── public/            # User-facing master views with schema context
+│   ├── foodlogstats   # Master view with schema_name column
+│   ├── summary views  # Future template-based views
+│   └── etc
+│
+├── tenant_a/          # Individual tenant data (clean, no client column)
+│   ├── foodlogstats_2025_09_24 # Daily materialized views
+│   ├── foodlogstats_2025_09_25
+│   └── foodlogstats   # Tenant's unified view (pure UNION ALL)
+│
+├── tenant_b/          # Repeat for each tenant
+└── tenant_c/
 ```
 
 ### Data Flow
@@ -339,10 +347,10 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO phood_ro;
 Standard PostgreSQL tools work perfectly with RDS:
 ```bash
 # Connect with psql
-psql -h your-warehouse.rds.amazonaws.com -U warehouse_user -d warehouse
+psql -h your-warehouse.rds.amazonaws.com -U whadmin -d postgres
 
 # Backup operational schema only (small, fast)
-pg_dump --schema=_wh warehouse_db > wh_infrastructure.sql
+pg_dump --schema=_wh postgres > wh_infrastructure.sql
 
 # No need to backup tenant schemas - recreate from source data
 ```
