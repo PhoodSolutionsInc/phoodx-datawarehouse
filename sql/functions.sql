@@ -462,11 +462,11 @@ GRANT EXECUTE ON FUNCTION _wh.log_debug(text, jsonb) TO whadmin;
 -- UNION VIEW FUNCTIONS
 -- =============================================================================
 
--- Create tenant union view from template-based MVs
+-- Create tenant union view from template-based MVs and yearly tables
 CREATE OR REPLACE FUNCTION _wh.update_tenant_union_view_by_template(
     template_name text,
-    tenant_connection_name text,
-    target_schema text
+    target_schema text,
+    exclude_pattern text DEFAULT NULL
 )
 RETURNS boolean
 LANGUAGE plpgsql
@@ -475,6 +475,7 @@ AS $function$
 DECLARE
     union_sql TEXT;
     mv_record RECORD;
+    table_record RECORD;
     context JSONB;
     view_count INTEGER := 0;
     view_basename TEXT;
@@ -483,20 +484,39 @@ BEGIN
 
     context := jsonb_build_object(
         'template', template_name,
-        'tenant', tenant_connection_name,
         'schema', target_schema,
-        'view_basename', view_basename
+        'view_basename', view_basename,
+        'exclude_pattern', exclude_pattern
     );
 
     PERFORM _wh.log_info('Creating tenant union view for template: ' || template_name || ' in schema: ' || target_schema, context);
 
-    -- Build UNION ALL query from all matching materialized views for this template
+    -- Build UNION ALL query from all matching materialized views and yearly tables
     union_sql := '';
+
+    -- Add yearly tables first (pattern: template_name_YYYY)
+    FOR table_record IN
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = target_schema
+        AND tablename ~ ('^' || template_name || '_[0-9]{4}$')
+        ORDER BY tablename
+    LOOP
+        IF view_count > 0 THEN
+            union_sql := union_sql || ' UNION ALL ';
+        END IF;
+        union_sql := union_sql || format('SELECT * FROM %I.%I', target_schema, table_record.tablename);
+        view_count := view_count + 1;
+        PERFORM _wh.log_debug('Added yearly table to union: ' || table_record.tablename, context);
+    END LOOP;
+
+    -- Add daily materialized views (pattern: template_name_YYYY_MM_DD)
     FOR mv_record IN
         SELECT matviewname
         FROM pg_matviews
         WHERE schemaname = target_schema
         AND matviewname LIKE template_name || '_%'
+        AND (exclude_pattern IS NULL OR matviewname NOT LIKE '%' || exclude_pattern || '%')
         ORDER BY matviewname
     LOOP
         IF view_count > 0 THEN
@@ -504,10 +524,11 @@ BEGIN
         END IF;
         union_sql := union_sql || format('SELECT * FROM %I.%I', target_schema, mv_record.matviewname);
         view_count := view_count + 1;
+        PERFORM _wh.log_debug('Added daily MV to union: ' || mv_record.matviewname, context);
     END LOOP;
 
     IF view_count = 0 THEN
-        PERFORM _wh.log_error('No materialized views found for template pattern: ' || target_schema || '.' || template_name || '_*', context);
+        PERFORM _wh.log_error('No materialized views or yearly tables found for template pattern: ' || target_schema || '.' || template_name || '_*', context);
         RETURN FALSE;
     END IF;
 
@@ -518,7 +539,7 @@ BEGIN
     EXECUTE format('ALTER VIEW %I.%I OWNER TO whadmin', target_schema, view_basename);
     EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, view_basename);
 
-    PERFORM _wh.log_info('Successfully created tenant union view with ' || view_count || ' materialized views', context);
+    PERFORM _wh.log_info('Successfully created tenant union view with ' || view_count || ' sources (MVs + yearly tables)', context);
     RETURN TRUE;
 EXCEPTION
     WHEN OTHERS THEN
@@ -594,6 +615,192 @@ $function$;
 
 -- Grant execute permission to whadmin only
 GRANT EXECUTE ON FUNCTION _wh.update_public_view_by_template(text) TO whadmin;
+
+-- =============================================================================
+-- YEARLY COMBINATION FUNCTIONS
+-- =============================================================================
+
+-- Create combined yearly table from daily MVs for a specific year
+CREATE OR REPLACE FUNCTION _wh.create_combined_table_from_template_by_year(
+    template_name text,
+    target_schema text,
+    target_year integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    yearly_table_name TEXT;
+    column_definitions TEXT;
+    indexes_sql TEXT;
+    mv_record RECORD;
+    context JSONB;
+    pre_count BIGINT := 0;
+    post_count BIGINT := 0;
+    processed_count INTEGER := 0;
+    inserted_count BIGINT := 0;
+    temp_inserted_count BIGINT;
+    start_time TIMESTAMP := NOW();
+    template_exists BOOLEAN := FALSE;
+    table_exists BOOLEAN := FALSE;
+    stub_sql TEXT;
+    create_sql TEXT;
+    insert_sql TEXT;
+    year_pattern TEXT;
+BEGIN
+    yearly_table_name := template_name || '_' || target_year::text;
+    year_pattern := template_name || '_' || target_year::text || '_%';
+
+    context := jsonb_build_object(
+        'template_name', template_name,
+        'target_schema', target_schema,
+        'target_year', target_year,
+        'yearly_table_name', yearly_table_name
+    );
+
+    PERFORM _wh.log_info('Starting yearly combination for template: ' || template_name || ' year: ' || target_year, context);
+
+    -- Step 1: Validate template exists
+    SELECT EXISTS (
+        SELECT 1 FROM _wh.mv_templates
+        WHERE mv_templates.template_name = create_combined_table_from_template_by_year.template_name
+    ) INTO template_exists;
+
+    IF NOT template_exists THEN
+        PERFORM _wh.log_error('Template not found: ' || template_name, context);
+        RETURN jsonb_build_object('success', false, 'error', 'Template not found: ' || template_name);
+    END IF;
+
+    -- Step 2: Check if yearly table already exists
+    SELECT EXISTS (
+        SELECT 1 FROM pg_tables
+        WHERE schemaname = target_schema
+        AND tablename = yearly_table_name
+    ) INTO table_exists;
+
+    IF table_exists THEN
+        PERFORM _wh.log_error('Yearly table already exists: ' || target_schema || '.' || yearly_table_name, context);
+        RETURN jsonb_build_object('success', false, 'error', 'Yearly table already exists: ' || target_schema || '.' || yearly_table_name);
+    END IF;
+
+    -- Step 3: Get pre-count from tenant union view (using UTC to match MV creation logic)
+    BEGIN
+        EXECUTE format('SELECT COUNT(*) FROM %I.%I WHERE EXTRACT(YEAR FROM logged_time AT TIME ZONE ''UTC'') = %s',
+                      target_schema, template_name, target_year) INTO pre_count;
+        PERFORM _wh.log_info('Pre-combination record count (UTC): ' || pre_count, context);
+    EXCEPTION
+        WHEN OTHERS THEN
+            PERFORM _wh.log_error('Failed to get pre-count from tenant union view: ' || SQLERRM, context);
+            RETURN jsonb_build_object('success', false, 'error', 'Failed to get pre-count: ' || SQLERRM);
+    END;
+
+    -- Start transaction for the combination process
+    BEGIN
+        -- Step 4: Recreate tenant union view excluding the year we're about to combine
+        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema, '_' || target_year::text || '_') THEN
+            RAISE EXCEPTION 'Failed to recreate tenant union view with exclusions';
+        END IF;
+        PERFORM _wh.log_info('Recreated tenant union view excluding year: ' || target_year, context);
+
+        -- Step 6: Get template definitions
+        SELECT mv_templates.column_definitions, mv_templates.indexes INTO column_definitions, indexes_sql
+        FROM _wh.mv_templates
+        WHERE mv_templates.template_name = create_combined_table_from_template_by_year.template_name;
+
+        -- Step 7: Create yearly table
+        create_sql := format('CREATE TABLE %I.%I (%s)', target_schema, yearly_table_name, column_definitions);
+        EXECUTE create_sql;
+        PERFORM _wh.log_info('Created yearly table: ' || target_schema || '.' || yearly_table_name, context);
+
+        -- Step 8: Set table ownership
+        EXECUTE format('ALTER TABLE %I.%I OWNER TO whadmin', target_schema, yearly_table_name);
+        EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, yearly_table_name);
+
+        -- Step 9: Create indexes
+        IF indexes_sql IS NOT NULL AND trim(indexes_sql) != '' THEN
+            -- Replace placeholders in index SQL
+            indexes_sql := replace(indexes_sql, '{SCHEMA}', target_schema);
+            indexes_sql := replace(indexes_sql, '{VIEW_NAME}', yearly_table_name);
+            EXECUTE indexes_sql;
+            PERFORM _wh.log_info('Created indexes for yearly table', context);
+        END IF;
+
+        -- Step 10: Process each matching MV
+        FOR mv_record IN
+            SELECT matviewname
+            FROM pg_matviews
+            WHERE schemaname = target_schema
+            AND matviewname LIKE year_pattern
+            ORDER BY matviewname
+        LOOP
+            -- Insert data from MV into yearly table
+            insert_sql := format('INSERT INTO %I.%I SELECT * FROM %I.%I',
+                                target_schema, yearly_table_name, target_schema, mv_record.matviewname);
+            EXECUTE insert_sql;
+
+            GET DIAGNOSTICS temp_inserted_count = ROW_COUNT;
+            inserted_count := inserted_count + temp_inserted_count;
+            processed_count := processed_count + 1;
+
+            PERFORM _wh.log_info('Inserted ' || temp_inserted_count || ' records from MV: ' || mv_record.matviewname, context);
+
+            -- Drop the materialized view
+            EXECUTE format('DROP MATERIALIZED VIEW %I.%I', target_schema, mv_record.matviewname);
+            PERFORM _wh.log_info('Dropped MV: ' || mv_record.matviewname, context);
+        END LOOP;
+
+        -- Step 11: Recreate tenant union view (include yearly table + remaining MVs)
+        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+            RAISE EXCEPTION 'Failed to recreate tenant union view';
+        END IF;
+        PERFORM _wh.log_info('Recreated tenant union view with yearly table', context);
+
+        -- Step 12: Get post-count from yearly table
+        EXECUTE format('SELECT COUNT(*) FROM %I.%I', target_schema, yearly_table_name) INTO post_count;
+        PERFORM _wh.log_info('Post-combination record count: ' || post_count, context);
+
+        -- Step 13: Verify record counts match
+        IF pre_count != post_count THEN
+            RAISE EXCEPTION 'Record count mismatch: pre_count=% post_count=%', pre_count, post_count;
+        END IF;
+
+        PERFORM _wh.log_info('Record count verification passed: ' || post_count || ' records', context);
+
+        -- Commit the transaction (implicit)
+        PERFORM _wh.log_info('Successfully completed yearly combination for ' || target_year ||
+                            ': processed ' || processed_count || ' MVs, combined ' || inserted_count || ' records', context);
+
+        RETURN jsonb_build_object(
+            'success', true,
+            'template_name', template_name,
+            'target_year', target_year,
+            'yearly_table_name', yearly_table_name,
+            'processed_mvs', processed_count,
+            'total_records', inserted_count,
+            'pre_count', pre_count,
+            'post_count', post_count,
+            'duration_seconds', EXTRACT(EPOCH FROM (NOW() - start_time))
+        );
+
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Transaction will auto-rollback on exception
+            PERFORM _wh.log_error('Yearly combination failed, transaction rolled back: ' || SQLERRM, context);
+            RETURN jsonb_build_object(
+                'success', false,
+                'error', SQLERRM,
+                'template_name', template_name,
+                'target_year', target_year,
+                'processed_mvs', processed_count,
+                'duration_seconds', EXTRACT(EPOCH FROM (NOW() - start_time))
+            );
+    END;
+END;
+$function$;
+
+-- Grant execute permission to whadmin only
+GRANT EXECUTE ON FUNCTION _wh.create_combined_table_from_template_by_year(text, text, integer) TO whadmin;
 
 -- =============================================================================
 -- CONNECTION MANAGEMENT

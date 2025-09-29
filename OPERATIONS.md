@@ -9,6 +9,7 @@ This guide covers day-to-day operational procedures for the PostgreSQL-based dat
 - [Dropping a Tenant](#dropping-a-tenant)
 - [Re-creating a Single Materialized View](#re-creating-a-single-materialized-view)
 - [Re-creating an Entire Tenant Dataset](#re-creating-an-entire-tenant-dataset)
+- [Converting Daily MVs to Yearly Tables](#converting-daily-mvs-to-yearly-tables)
 - [Connecting to the DataWarehouse for Reports](#connecting-to-the-datawarehouse-for-reports)
 - [Adding a New Template](#adding-a-new-template)
 - [Adding a New Type of DataTable/MV (Legacy)](#adding-a-new-type-of-datatablemv-legacy)
@@ -359,6 +360,87 @@ SELECT _wh.update_tenant_view(
 
 ---
 
+## Converting Daily MVs to Yearly Tables
+
+### Overview
+At the end of each year, convert daily materialized views to a single yearly table for improved performance and storage efficiency. This process combines all daily MVs for a specific year into one table and removes the individual daily MVs.
+
+### Prerequisites
+- All daily MVs for the target year must exist
+- No other processes should be updating the same tenant during this operation
+- Ensure sufficient disk space for the yearly table creation
+
+### Step 1: Verify Year is Complete
+```sql
+-- Check that all expected daily MVs exist for the year
+SELECT COUNT(*) as daily_mvs_count
+FROM pg_matviews
+WHERE schemaname = 'tenant_schema'
+AND matviewname LIKE 'foodlogstats_2024_%';
+
+-- Should be 365 or 366 for leap years
+```
+
+### Step 2: Run Yearly Combination
+```sql
+-- Connect as whadmin user
+-- Combine all 2024 daily MVs into a yearly table
+SELECT _wh.create_combined_table_from_template_by_year(
+    'foodlogstats',     -- template name
+    'tenant_schema',    -- target schema
+    2024               -- target year
+);
+```
+
+### Step 3: Verify Results
+```sql
+-- Check that yearly table was created
+SELECT COUNT(*) FROM tenant_schema.foodlogstats_2024;
+
+-- Verify tenant union view includes the yearly table
+SELECT COUNT(*) FROM tenant_schema.foodlogstats
+WHERE EXTRACT(YEAR FROM logged_time AT TIME ZONE 'UTC') = 2024;
+
+-- Update public union view to include changes
+SELECT _wh.update_public_view_by_template('foodlogstats');
+```
+
+### Step 4: Monitor and Validate
+```sql
+-- Check function results (returned as JSON)
+-- Look for: {"success": true, "processed_mvs": 365, "total_records": 1529432}
+
+-- Verify no daily MVs remain for the year
+SELECT COUNT(*) as remaining_daily_mvs
+FROM pg_matviews
+WHERE schemaname = 'tenant_schema'
+AND matviewname LIKE 'foodlogstats_2024_%';
+-- Should be 0
+```
+
+### What the Function Does
+1. **Validates** template exists and yearly table doesn't exist
+2. **Temporarily modifies** tenant union view to exclude target year MVs
+3. **Creates yearly table** using template column definitions and indexes
+4. **Processes each daily MV**: INSERT data → DROP MV
+5. **Recreates union view** to include new yearly table
+6. **Returns detailed results** including counts and timing
+
+### Rollback Plan
+If the operation fails:
+- Transaction automatically rolls back
+- All daily MVs remain intact
+- Tenant union view is restored to original state
+- No data loss occurs
+
+### Performance Notes
+- Operation runs in a single transaction (may take 30-60 minutes for large datasets)
+- During processing, the tenant union view temporarily excludes the target year
+- Public union view remains accessible throughout the process
+- Storage space is reduced by ~30-50% after yearly conversion
+
+---
+
 ## Connecting to the DataWarehouse for Reports
 
 ### Database Connection Details
@@ -429,6 +511,11 @@ Creating a new template allows you to define new types of materialized views wit
 ### Step 1: Create Template SQL File
 Create a new file: `sql/template-{name}.sql`
 
+**🚨 CRITICAL TIMEZONE REQUIREMENT:**
+- **ALL datetime filtering in templates MUST use UTC timezone**
+- **NEVER use `timestamp::DATE` - ALWAYS use `(timestamp AT TIME ZONE 'UTC')::DATE`**
+- **Failure to use UTC will cause data inconsistencies and cross-date contamination**
+
 ```sql
 -- Example: sql/template-inventory_stats.sql
 INSERT INTO _wh.mv_templates (
@@ -451,7 +538,7 @@ SELECT
     i.timestamp AS recorded_time
 FROM inventory_movements i
 LEFT JOIN locations l ON i.location_id = l.id
-WHERE i.timestamp::DATE = '{TARGET_DATE}'::DATE
+WHERE (i.timestamp AT TIME ZONE 'UTC')::DATE = '{TARGET_DATE}'::DATE
 $template$,
     $columns$
 id INTEGER,

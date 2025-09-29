@@ -47,7 +47,7 @@ LEFT JOIN (
     FROM phood_menuitem pm
     LEFT JOIN phood_station ps ON ps.id = pm.station_id
 ) s ON (pf.inventory_item_id = s.inventory_item_id AND s.location_id = pf.location_id)
-WHERE pf.logged_time::DATE = '{TARGET_DATE}'::DATE
+WHERE (pf.logged_time AT TIME ZONE 'UTC')::DATE = '{TARGET_DATE}'::DATE
 $template$,
     $columns$
 id INTEGER,
