@@ -137,7 +137,7 @@ CREATE OR REPLACE FUNCTION _wh.update_mv_by_template(
     template_name text,
     tenant_connection_name text,
     target_schema text,
-    target_date date,
+    target_date date DEFAULT (NOW() AT TIME ZONE 'UTC')::DATE,
     allow_refresh_yesterday boolean DEFAULT true
 )
 RETURNS boolean
@@ -345,6 +345,230 @@ AS $function$
 
 ALTER FUNCTION _wh.create_mv_name(text, date) OWNER TO postgres;
 GRANT EXECUTE ON FUNCTION _wh.create_mv_name(text, date) TO whadmin;
+
+CREATE OR REPLACE FUNCTION _wh.current_date_utc()
+ RETURNS date
+ LANGUAGE plpgsql
+AS $function$
+  BEGIN
+      RETURN (NOW() AT TIME ZONE 'UTC')::DATE;
+  END;
+  $function$
+;
+
+ALTER FUNCTION _wh.current_date_utc() OWNER TO postgres;
+GRANT EXECUTE ON FUNCTION _wh.current_date_utc() TO whadmin;
+
+-- Check for missing or stale MVs/yearly tables for a given template and year
+CREATE OR REPLACE FUNCTION _wh.check_views_by_template_for_year(
+    template_name text,
+    target_schema text,
+    target_year integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    yearly_table_name TEXT;
+    yearly_table_exists BOOLEAN := FALSE;
+    expected_days INTEGER;
+    existing_mvs INTEGER := 0;
+    missing_mvs INTEGER := 0;
+    stale_mvs INTEGER := 0;
+    issues JSONB := '[]'::JSONB;
+    results JSONB;
+    context JSONB;
+    mv_record RECORD;
+    check_date DATE;
+    expected_mv_name TEXT;
+    mv_exists BOOLEAN;
+BEGIN
+    yearly_table_name := template_name || '_' || target_year::text;
+
+    context := jsonb_build_object(
+        'template_name', template_name,
+        'target_schema', target_schema,
+        'target_year', target_year,
+        'yearly_table_name', yearly_table_name
+    );
+
+    PERFORM _wh.log_info('Checking data integrity for template: ' || template_name || ' year: ' || target_year, context);
+
+    -- Check if yearly table exists
+    SELECT EXISTS (
+        SELECT 1 FROM pg_tables
+        WHERE schemaname = target_schema
+        AND tablename = yearly_table_name
+    ) INTO yearly_table_exists;
+
+    -- Calculate expected days for the year
+    IF target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN
+        -- Current year: only expect MVs up to current date
+        expected_days := EXTRACT(DOY FROM _wh.current_date_utc())::INTEGER;
+    ELSE
+        -- Past/future year: use full year calculation
+        expected_days := (DATE (target_year || '-12-31') - DATE (target_year || '-01-01') + 1)::INTEGER;
+    END IF;
+
+    -- Count existing daily MVs for the year
+    SELECT COUNT(*) INTO existing_mvs
+    FROM pg_matviews
+    WHERE schemaname = target_schema
+    AND matviewname LIKE template_name || '_' || target_year::text || '_%';
+
+    -- SCENARIO 1: Yearly table exists
+    IF yearly_table_exists THEN
+        IF existing_mvs > 0 THEN
+            -- Issue: Yearly table exists but daily MVs still present (stale MVs)
+            stale_mvs := existing_mvs;
+            issues := issues || jsonb_build_object(
+                'issue_type', 'STALE_MVS_WITH_YEARLY_TABLE',
+                'severity', 'HIGH',
+                'description', 'Yearly table exists but ' || existing_mvs || ' daily MVs remain',
+                'recommendation', 'Drop stale daily MVs or re-run yearly combination',
+                'stale_mv_count', existing_mvs
+            );
+
+            -- List the stale MVs
+            FOR mv_record IN
+                SELECT matviewname
+                FROM pg_matviews
+                WHERE schemaname = target_schema
+                AND matviewname LIKE template_name || '_' || target_year::text || '_%'
+                ORDER BY matviewname
+            LOOP
+                issues := issues || jsonb_build_object(
+                    'issue_type', 'STALE_MV',
+                    'severity', 'MEDIUM',
+                    'description', 'Stale MV: ' || mv_record.matviewname,
+                    'recommendation', 'DROP MATERIALIZED VIEW ' || target_schema || '.' || mv_record.matviewname
+                );
+            END LOOP;
+        ELSE
+            -- Good: Yearly table exists and no stale MVs
+            issues := issues || jsonb_build_object(
+                'issue_type', 'HEALTHY_YEARLY_TABLE',
+                'severity', 'INFO',
+                'description', 'Yearly table exists with no stale daily MVs',
+                'recommendation', 'No action needed'
+            );
+        END IF;
+    ELSE
+        -- SCENARIO 2: No yearly table, check for missing daily MVs
+        missing_mvs := expected_days - existing_mvs;
+
+        IF missing_mvs > 0 THEN
+            issues := issues || jsonb_build_object(
+                'issue_type', 'MISSING_DAILY_MVS',
+                'severity', 'MEDIUM',
+                'description', 'Missing ' || missing_mvs || ' daily MVs out of ' || expected_days || ' expected',
+                'recommendation', 'Run backfill or create yearly table from existing MVs',
+                'missing_count', missing_mvs,
+                'existing_count', existing_mvs,
+                'expected_count', expected_days
+            );
+
+            -- Check specific missing dates (sample first 10)
+            FOR check_date IN
+                SELECT generate_series(
+                    (target_year || '-01-01')::date,
+                    (target_year || '-12-31')::date,
+                    '1 day'::interval
+                )::date
+                LIMIT 10
+            LOOP
+                expected_mv_name := _wh.create_mv_name(template_name, check_date);
+                SELECT _wh.does_mv_exist(target_schema, expected_mv_name) INTO mv_exists;
+
+                IF NOT mv_exists THEN
+                    issues := issues || jsonb_build_object(
+                        'issue_type', 'MISSING_DAILY_MV',
+                        'severity', 'LOW',
+                        'description', 'Missing MV: ' || expected_mv_name,
+                        'recommendation', 'Run: SELECT _wh.update_mv_by_template(''' || template_name || ''', ''connection_name'', ''' || target_schema || ''', ''' || check_date || ''')',
+                        'missing_date', check_date
+                    );
+                END IF;
+            END LOOP;
+
+            -- Add note if we truncated the list
+            IF missing_mvs > 10 THEN
+                issues := issues || jsonb_build_object(
+                    'issue_type', 'TRUNCATED_MISSING_LIST',
+                    'severity', 'INFO',
+                    'description', 'Only showing first 10 missing MVs, ' || (missing_mvs - 10) || ' more exist',
+                    'recommendation', 'Check full year manually or run bulk backfill'
+                );
+            END IF;
+        ELSE
+            -- Good: All daily MVs present
+            IF target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN
+                -- Current year: MVs up to date
+                issues := issues || jsonb_build_object(
+                    'issue_type', 'CURRENT_YEAR_UP_TO_DATE',
+                    'severity', 'INFO',
+                    'description', 'All ' || expected_days || ' daily MVs present for current year (up to today)',
+                    'recommendation', 'No action needed - current year data is up to date'
+                );
+            ELSE
+                -- Past year: ready for yearly combination
+                issues := issues || jsonb_build_object(
+                    'issue_type', 'COMPLETE_DAILY_MVS',
+                    'severity', 'INFO',
+                    'description', 'All ' || expected_days || ' daily MVs present for year',
+                    'recommendation', 'Consider running yearly combination: SELECT _wh.create_combined_table_from_template_by_year(''' || template_name || ''', ''' || target_schema || ''', ' || target_year || ')'
+                );
+            END IF;
+        END IF;
+    END IF;
+
+    -- Build final results
+    results := jsonb_build_object(
+        'template_name', template_name,
+        'target_schema', target_schema,
+        'target_year', target_year,
+        'yearly_table_exists', yearly_table_exists,
+        'expected_days', expected_days,
+        'existing_daily_mvs', existing_mvs,
+        'missing_mvs', missing_mvs,
+        'stale_mvs', stale_mvs,
+        'total_issues', jsonb_array_length(issues),
+        'status', CASE
+            WHEN jsonb_array_length(issues) = 0 THEN 'HEALTHY'
+            WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(issues) elem WHERE elem->>'severity' = 'HIGH') THEN 'CRITICAL'
+            WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(issues) elem WHERE elem->>'severity' = 'MEDIUM') THEN 'WARNING'
+            ELSE 'INFO'
+        END,
+        'issues', issues,
+        'summary', CASE
+            WHEN yearly_table_exists AND existing_mvs = 0 THEN 'Healthy: Yearly table exists, no stale MVs'
+            WHEN yearly_table_exists AND existing_mvs > 0 THEN 'Critical: Stale MVs exist with yearly table'
+            WHEN NOT yearly_table_exists AND missing_mvs = 0 AND target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN 'Healthy: Current year data up to date'
+            WHEN NOT yearly_table_exists AND missing_mvs = 0 THEN 'Ready: All daily MVs present, ready for yearly combination'
+            WHEN NOT yearly_table_exists AND missing_mvs > 0 THEN 'Warning: Missing ' || missing_mvs || ' daily MVs'
+            ELSE 'Unknown status'
+        END
+    );
+
+    PERFORM _wh.log_info('Data integrity check completed: ' || (results->>'status'), context);
+    RETURN results;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM _wh.log_error('Error in check_views_by_template_for_year: ' || SQLERRM, context);
+        RETURN jsonb_build_object(
+            'success', false,
+            'error', SQLERRM,
+            'template_name', template_name,
+            'target_schema', target_schema,
+            'target_year', target_year
+        );
+END;
+$function$;
+
+-- Grant execute permission to whadmin only
+GRANT EXECUTE ON FUNCTION _wh.check_views_by_template_for_year(text, text, integer) TO whadmin;
 
 CREATE OR REPLACE FUNCTION _wh.does_mv_exist(target_schema text, view_name text)
  RETURNS boolean

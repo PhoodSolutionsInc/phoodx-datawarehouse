@@ -24,7 +24,7 @@ CREATE EXTENSION IF NOT EXISTS dblink;
 -- NOTE: pg_cron setup requires specific AWS RDS configuration
 -- Follow AWS documentation before creating the extension:
 -- https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/PostgreSQL_pg_cron.html#PostgreSQL_pg_cron.enable
--- CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
 
 -- =============================================================================
 -- USER CREATION
@@ -82,6 +82,20 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO phood_ro;
 
 -- Set default privileges for future objects in public schema
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO phood_ro;
+
+
+-- =============================================================================
+-- PG_CRON PERMISSIONS SETUP
+-- =============================================================================
+-- Connect as postgres superuser and grant permissions
+GRANT USAGE ON SCHEMA cron TO whadmin;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA cron TO whadmin;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA cron TO whadmin;
+
+-- Grant permissions on the specific cron functions
+GRANT EXECUTE ON FUNCTION cron.schedule(text, text, text) TO whadmin;
+GRANT EXECUTE ON FUNCTION cron.unschedule(text) TO whadmin;
+
 
 -- =============================================================================
 -- CREATE COMMON SCHEMAS
