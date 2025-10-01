@@ -6,12 +6,15 @@ This guide covers day-to-day operational procedures for the PostgreSQL-based dat
 
 - [Creating a Brand New DataWarehouse from Scratch](#creating-a-brand-new-datawarehouse-from-scratch)
 - [Adding a New Tenant](#adding-a-new-tenant)
+- [Disabling a Tenant](#disabling-a-tenant)
+- [Re-enabling a Tenant](#re-enabling-a-tenant)
 - [Dropping a Tenant](#dropping-a-tenant)
 - [Re-creating a Single Materialized View](#re-creating-a-single-materialized-view)
 - [Re-creating an Entire Tenant Dataset](#re-creating-an-entire-tenant-dataset)
 - [Converting Daily MVs to Yearly Tables](#converting-daily-mvs-to-yearly-tables)
 - [Connecting to the DataWarehouse for Reports](#connecting-to-the-datawarehouse-for-reports)
 - [Adding a New Template](#adding-a-new-template)
+- [Updating Warehouse Functions](#updating-warehouse-functions)
 - [Adding a New Type of DataTable/MV (Legacy)](#adding-a-new-type-of-datatablemv-legacy)
 - [Managing Cron Jobs](#managing-cron-jobs)
 - [Troubleshooting](#troubleshooting)
@@ -180,7 +183,18 @@ SELECT * FROM dblink(
 ) AS t(test integer);
 ```
 
-### Step 4: Initial Data Load (Template-Based)
+### Step 4: Determine Initial load Date Range
+```sql
+--- Connect as whadmin user for data operations
+-- select MIN and MAX date value from source table. In this eg, the foodlogsum table
+select * FROM dblink(
+    _wh.get_tenant_connection_string('new_tenant_connecton_name'),
+    'SELECT MIN(logged_time), MAX(logged_time) from phood_foodlogsum') 
+    as t(min_time TIMESTAMPTZ, max_time TIMESTAMPTZ)
+
+```
+
+### Step 5: Initial Data Load (Template-Based)
 ```sql
 -- Connect as whadmin user for data operations
 -- Create first materialized view (current date)
@@ -188,16 +202,18 @@ SELECT _wh.update_mv_by_template(
     'foodlogstats',                   -- template name
     'new_tenant_connection_name',     -- connection name
     'new_tenant_name',               -- schema name
-    CURRENT_DATE
+    _wh.current_date_utc()
 );
 
--- Backfill historical data (one month at a time)
+-- Backfill historical data (one year or less at a time). Be careful, this could put a load on the source DB.
+-- Run the window function until we're caught up to today. The reason for a year or less also depends on the 
+-- size of the source dataset.  As running this function creates one massive transaction.
 SELECT _wh.update_mv_window_by_template(
     'foodlogstats',                   -- template name
     'new_tenant_connection_name',     -- connection name
     'new_tenant_name',               -- schema name
-    '2024-01-01'::date,
-    '2024-01-31'::date
+    '2024-01-01'
+    '2025-02-18'
 );
 
 -- Create unified tenant view
@@ -211,23 +227,229 @@ SELECT _wh.update_tenant_union_view_by_template(
 SELECT _wh.update_public_view_by_template('foodlogstats');
 ```
 
-### Step 5: Update Master Cross-Tenant View
+### Step 6: Convert Completed Years to Yearly Tables (Optional)
+
+If your backfill included complete calendar years (not just current year), convert them to yearly tables for better performance and storage efficiency.
+
 ```sql
--- Connect as postgres user to update public schema
--- Update the master foodlogstats view to include the new tenant
--- Example for adding 'new_tenant_name' to existing tenants:
+-- Convert completed years to yearly tables (one year at a time)
+-- Only convert years that are complete (365/366 daily MVs exist)
 
-CREATE OR REPLACE VIEW public.foodlogstats AS
-SELECT * FROM landb.foodlogstats
-UNION ALL
-SELECT * FROM mm.foodlogstats
-UNION ALL
-SELECT * FROM new_tenant_name.foodlogstats;
+-- Check how many daily MVs exist for each year
+SELECT
+    EXTRACT(YEAR FROM TO_DATE(
+        regexp_replace(matviewname, '.*_(\d{4}_\d{2}_\d{2})$', '\1'),
+        'YYYY_MM_DD'
+    )) as year,
+    COUNT(*) as daily_mvs_count
+FROM pg_matviews
+WHERE schemaname = 'new_tenant_name'
+AND matviewname LIKE 'foodlogstats_%'
+GROUP BY EXTRACT(YEAR FROM TO_DATE(
+    regexp_replace(matviewname, '.*_(\d{4}_\d{2}_\d{2})$', '\1'),
+    'YYYY_MM_DD'
+))
+ORDER BY year;
 
--- Grant read access to both users
-GRANT SELECT ON public.foodlogstats TO phood_ro;
-GRANT SELECT ON public.foodlogstats TO whadmin;
+-- Convert complete years (365 or 366 MVs) to yearly tables
+-- Example: Convert 2023 if it has 365 MVs
+SELECT _wh.create_combined_table_from_template_by_year(
+    'foodlogstats',        -- template name
+    'new_tenant_name',     -- schema name
+    2023                   -- year to convert
+);
+
+-- Convert 2024 if complete
+SELECT _wh.create_combined_table_from_template_by_year(
+    'foodlogstats',        -- template name
+    'new_tenant_name',     -- schema name
+    2024                   -- year to convert
+);
+
+-- Verify yearly tables were created and union view updated
+SELECT COUNT(*) FROM new_tenant_name.foodlogstats_2023;
+SELECT COUNT(*) FROM new_tenant_name.foodlogstats_2024;
+
+-- Final verification: Check union view includes yearly data
+SELECT
+    EXTRACT(YEAR FROM logged_time AT TIME ZONE 'UTC') as year,
+    COUNT(*) as records
+FROM new_tenant_name.foodlogstats
+WHERE EXTRACT(YEAR FROM logged_time AT TIME ZONE 'UTC') IN (2023, 2024)
+GROUP BY EXTRACT(YEAR FROM logged_time AT TIME ZONE 'UTC')
+ORDER BY year;
 ```
+
+**Benefits of Yearly Conversion:**
+- **Performance**: Single table scan vs. 365 MV unions
+- **Storage**: 30-50% reduction in disk usage
+- **Maintenance**: Simpler backup and maintenance operations
+- **Queries**: Faster year-over-year analysis
+
+**When to Convert:**
+- ✅ **Complete years only** (365/366 days of data)
+- ✅ **Historical years** (not current year)
+- ✅ **During low-usage periods** (conversion takes 30-60 minutes)
+- ❌ **Skip current year** (daily updates still needed)
+
+---
+
+## Disabling a Tenant
+
+### Overview
+Temporarily disable a tenant's data processing while keeping all existing data intact. This is useful for maintenance, cost reduction, or when a tenant is temporarily inactive.
+
+### Step 1: Disable Cron Jobs
+```sql
+-- Connect as whadmin user
+-- List current jobs for the tenant
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+WHERE jobname LIKE '%tenant_name%'
+ORDER BY jobname;
+
+-- Disable hourly MV updates
+UPDATE cron.job
+SET active = false
+WHERE jobname = 'foodlogstats_update_tenant_name';
+
+-- Disable nightly 2-week refresh
+UPDATE cron.job
+SET active = false
+WHERE jobname = 'tenant_name_2week_refresh';
+
+-- Disable yearly combination (if applicable)
+UPDATE cron.job
+SET active = false
+WHERE jobname = 'yearly_combination_tenant_name';
+```
+
+### Step 2: Verify Jobs are Disabled
+```sql
+-- Confirm jobs are inactive
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+WHERE jobname LIKE '%tenant_name%'
+AND active = true;
+-- Should return no rows
+```
+
+### Step 3: Optional - Document Reason
+```sql
+-- Add a comment to the tenant connection for reference
+UPDATE _wh.tenant_connections
+SET updated_at = NOW()
+WHERE tenant_name = 'tenant_name';
+
+-- Add to maintenance log
+INSERT INTO _wh.function_logs (function_name, log_level, message, context)
+VALUES ('manual_operation', 'INFO', 'Tenant disabled',
+        jsonb_build_object('tenant_name', 'tenant_name', 'reason', 'maintenance', 'disabled_date', NOW()));
+```
+
+### What Happens When Disabled
+- ✅ **Existing data preserved** - All MVs, yearly tables, and union views remain
+- ✅ **Union views stay functional** - Reporting continues with existing data
+- ✅ **Public view unaffected** - Cross-tenant reports continue working
+- ❌ **No new data processing** - Daily MVs stop updating
+- ❌ **Data becomes stale** - Information becomes outdated over time
+
+---
+
+## Re-enabling a Tenant
+
+### Overview
+Reactivate a disabled tenant and catch up on missed data processing. This process safely brings the tenant back online with all historical data.
+
+### Step 1: Determine Catch-Up Period
+```sql
+-- Find the last updated MV to see how far behind we are
+SELECT MAX(matviewname) as last_mv
+FROM pg_matviews
+WHERE schemaname = 'tenant_schema'
+AND matviewname LIKE 'foodlogstats_%';
+
+-- Check tenant connection is still valid
+SELECT * FROM _wh.tenant_connections
+WHERE tenant_name = 'tenant_connection_name';
+
+-- Test connection
+SELECT * FROM dblink(
+    _wh.get_tenant_connection_string('tenant_connection_name'),
+    'SELECT 1 as test'
+) AS t(test integer);
+```
+
+### Step 2: Re-enable Cron Jobs
+```sql
+-- Connect as whadmin user
+-- Re-enable hourly MV updates
+UPDATE cron.job
+SET active = true
+WHERE jobname = 'foodlogstats_update_tenant_name';
+
+-- Re-enable nightly 2-week refresh
+UPDATE cron.job
+SET active = true
+WHERE jobname = 'tenant_name_2week_refresh';
+
+-- Re-enable yearly combination (if applicable)
+UPDATE cron.job
+SET active = true
+WHERE jobname = 'yearly_combination_tenant_name';
+```
+
+### Step 3: Backfill Missing Data
+```sql
+-- Backfill from last MV date to current date
+-- IMPORTANT: Be conservative with date ranges to avoid overloading source DB
+SELECT _wh.update_mv_window_by_template(
+    'foodlogstats',
+    'tenant_connection_name',
+    'tenant_schema',
+    '2024-12-01'::date,  -- Start from last known good date
+    _wh.current_date_utc() - INTERVAL '1 day'  -- Up to yesterday
+);
+
+-- For large gaps, process in smaller chunks (1 month at a time)
+SELECT _wh.update_mv_window_by_template(
+    'foodlogstats',
+    'tenant_connection_name',
+    'tenant_schema',
+    '2024-12-01'::date,
+    '2024-12-31'::date
+);
+```
+
+### Step 4: Verify Catch-Up Success
+```sql
+-- Check data integrity for recent period
+SELECT _wh.check_views_by_template_for_year('foodlogstats', 'tenant_schema', 2024);
+
+-- Verify union view is working
+SELECT COUNT(*) FROM tenant_schema.foodlogstats
+WHERE logged_time >= '2024-12-01'::date;
+
+-- Update public master view
+SELECT _wh.update_public_view_by_template('foodlogstats');
+```
+
+### Step 5: Monitor First Few Runs
+```sql
+-- Monitor cron job execution
+SELECT j.jobname, r.status, r.start_time, r.end_time, r.return_message
+FROM cron.job j
+JOIN cron.job_run_details r ON j.jobid = r.jobid
+WHERE j.jobname LIKE '%tenant_name%'
+AND r.start_time > NOW() - INTERVAL '24 hours'
+ORDER BY r.start_time DESC;
+```
+
+### Best Practices for Re-enabling
+- **Start small** - Backfill in monthly chunks to avoid overwhelming source systems
+- **Monitor performance** - Watch for any degradation during catch-up
+- **Verify data quality** - Check for any anomalies in backfilled data
+- **Coordinate timing** - Re-enable during off-peak hours when possible
 
 ---
 
@@ -235,23 +457,68 @@ GRANT SELECT ON public.foodlogstats TO whadmin;
 
 ### ⚠️ WARNING: This will permanently delete all tenant data!
 
-### Step 1: Remove from Union Views
+### Step 1: Disable Cron Jobs First
 ```sql
--- First, manually update any cross-tenant union views to exclude this tenant
--- (This step depends on your specific setup)
+-- Connect as whadmin user
+-- Stop all automated processing for the tenant
+UPDATE cron.job
+SET active = false
+WHERE jobname LIKE '%tenant_name%';
+
+-- Verify jobs are disabled
+SELECT jobid, jobname, active
+FROM cron.job
+WHERE jobname LIKE '%tenant_name%';
 ```
 
-### Step 2: Drop Tenant Schema
+### Step 2: Remove Cron Job Definitions
 ```sql
--- This will cascade and drop all materialized views and tables
-DROP SCHEMA tenant_name CASCADE;
+-- Permanently delete the cron jobs (optional - disabling is sufficient)
+SELECT cron.unschedule('foodlogstats_update_tenant_name');
+SELECT cron.unschedule('tenant_name_2week_refresh');
+SELECT cron.unschedule('yearly_combination_tenant_name');
 ```
 
-### Step 3: Remove Connection
+### Step 3: Drop Tenant Schema
+```sql
+-- This will cascade and drop all materialized views, yearly tables, and union views
+DROP SCHEMA tenant_schema_name CASCADE;
+```
+
+### Step 4: Update Public Master View
+```sql
+-- CRITICAL: Update public view to exclude dropped tenant
+-- This prevents the public view from breaking when the tenant schema is gone
+
+-- Option A: Automatic update (recommended)
+SELECT _wh.update_public_view_by_template('foodlogstats');
+
+-- Option B: Manual verification of what's left
+SELECT DISTINCT schemaname
+FROM pg_views
+WHERE viewname = 'foodlogstats'
+AND schemaname NOT IN ('public', '_wh');
+
+-- The public view will now only include remaining active tenants
+```
+
+### Step 5: Remove Connection Details
 ```sql
 -- Remove tenant connection details
 DELETE FROM _wh.tenant_connections
 WHERE tenant_name = 'tenant_connection_name';
+```
+
+### Step 6: Verify Public View Integrity
+```sql
+-- Test that public view still works
+SELECT COUNT(*) FROM public.foodlogstats;
+
+-- Verify which tenants are still included
+SELECT schema_name, COUNT(*) as record_count
+FROM public.foodlogstats
+GROUP BY schema_name
+ORDER BY schema_name;
 ```
 
 ### Step 4: Clean Up Permissions
@@ -587,6 +854,178 @@ SELECT * FROM _wh.mv_templates WHERE template_name = 'inventory_stats';
 -- Update template (edit the .sql file and re-run it)
 -- Templates use ON CONFLICT DO UPDATE, so re-running updates safely
 ```
+
+---
+
+## Updating Warehouse Functions
+
+When you need to modify or add warehouse functions (in `sql/functions.sql`), here are the recommended methods for updating them in the database.
+
+### Method 1: DBeaver GUI Approach (Recommended)
+
+This is the safest and most visual method for function updates.
+
+#### Step 1: Connect to Database
+```
+Host: your-warehouse.rds.amazonaws.com
+Port: 5432
+Database: postgres
+Username: postgres
+Password: [your postgres password]
+```
+
+#### Step 2: Drop Existing Functions via DBeaver
+1. **Navigate to Functions**:
+   - Expand `postgres` database → `Schemas` → `_wh` → `Functions`
+2. **Select Functions to Update**:
+   - Hold `Ctrl/Cmd` and click multiple functions to select them
+   - Right-click → `Delete` (or press `Delete` key)
+3. **Confirm Deletion**:
+   - DBeaver will show you the DROP statements
+   - Click `Proceed` to execute
+
+#### Step 3: Run Updated Functions Script
+1. **Open SQL Editor**: File → New → SQL Editor
+2. **Load Script**: Open `sql/functions.sql`
+3. **Execute**: Click the "Execute SQL Script" button (or `Ctrl+Shift+Enter`)
+4. **Verify Success**: Check for any error messages in the output
+
+### Method 2: Command Line Approach
+
+For users comfortable with psql command line.
+
+#### Step 1: Connect as postgres user
+```bash
+psql -h your-warehouse.rds.amazonaws.com -U postgres -d postgres
+```
+
+#### Step 2: Drop Functions (Script Method)
+```sql
+-- Drop all _wh functions at once
+DO $$
+DECLARE
+    func_record RECORD;
+BEGIN
+    FOR func_record IN
+        SELECT routine_name, routine_type
+        FROM information_schema.routines
+        WHERE routine_schema = '_wh'
+        AND routine_type = 'FUNCTION'
+    LOOP
+        EXECUTE 'DROP FUNCTION IF EXISTS _wh.' || func_record.routine_name || ' CASCADE';
+        RAISE NOTICE 'Dropped function: %', func_record.routine_name;
+    END LOOP;
+END $$;
+```
+
+#### Step 3: Load New Functions
+```sql
+-- Execute the functions script
+\i sql/functions.sql
+```
+
+### Method 3: CREATE OR REPLACE (Automatic)
+
+**Note**: This only works if function signatures haven't changed. If you've added/removed parameters, you must use Method 1 or 2.
+
+```bash
+# Simply re-run the functions file
+psql -h your-warehouse.rds.amazonaws.com -U postgres -d postgres -f sql/functions.sql
+```
+
+### Method 4: Individual Function Updates
+
+For updating just one or two specific functions.
+
+```sql
+-- Connect as postgres user
+-- Drop specific function(s)
+DROP FUNCTION IF EXISTS _wh.update_mv_by_template(text, text, text, date, boolean, boolean) CASCADE;
+DROP FUNCTION IF EXISTS _wh.update_mv_window_by_template(text, text, text, date, date) CASCADE;
+
+-- Then run the functions.sql script to recreate them
+\i sql/functions.sql
+```
+
+### Verification Steps
+
+After any function update method:
+
+```sql
+-- Check that all expected functions exist
+SELECT
+    routine_name,
+    routine_type,
+    data_type
+FROM information_schema.routines
+WHERE routine_schema = '_wh'
+ORDER BY routine_name;
+
+-- Test a critical function
+SELECT _wh.current_date_utc();
+
+-- Check function permissions
+SELECT
+    p.proname as function_name,
+    array_to_string(p.proacl, ', ') as permissions
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE n.nspname = '_wh'
+ORDER BY p.proname;
+```
+
+### Safety Considerations
+
+#### Before Updating Functions:
+- ✅ **Check for active jobs**: Ensure no cron jobs are currently running
+- ✅ **Backup connection data**: Export `_wh.tenant_connections` if needed
+- ✅ **Test in development**: Always test function changes on a dev instance first
+
+#### Function Dependencies:
+- **Templates remain intact**: Function updates don't affect `_wh.mv_templates`
+- **Data preservation**: Existing MVs and yearly tables are unaffected
+- **Permission grants**: May need to re-grant execute permissions after updates
+
+### Troubleshooting Function Updates
+
+#### Issue: "Function does not exist" errors
+```sql
+-- Check if function was actually dropped
+SELECT routine_name
+FROM information_schema.routines
+WHERE routine_schema = '_wh'
+AND routine_name = 'problematic_function_name';
+```
+
+#### Issue: "Permission denied" errors
+```sql
+-- Re-grant permissions to whadmin
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA _wh TO whadmin;
+```
+
+#### Issue: "Function signature mismatch"
+```sql
+-- Find all versions of a function
+SELECT
+    p.proname,
+    pg_catalog.pg_get_function_arguments(p.oid) as arguments
+FROM pg_proc p
+JOIN pg_namespace n ON p.pronamespace = n.oid
+WHERE n.nspname = '_wh'
+AND p.proname = 'function_name'
+ORDER BY p.proname;
+
+-- Drop all versions with CASCADE
+DROP FUNCTION _wh.function_name CASCADE;
+```
+
+### Best Practices
+
+1. **Use DBeaver GUI** for complex updates - visual confirmation reduces errors
+2. **Test immediately** after function updates with simple function calls
+3. **Update during maintenance windows** to avoid disrupting active operations
+4. **Keep function backups** - save previous versions of `functions.sql` before major changes
+5. **Document changes** - Note what functions were modified and why
 
 ---
 

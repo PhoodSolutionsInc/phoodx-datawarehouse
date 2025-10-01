@@ -22,6 +22,7 @@ SELECT
     pi.name,
     pf.quantity,
     pp.average_weight,
+    pp.name as pan_name,
     (pf.quantity - pp.average_weight) AS weight,
     pfo.name AS food_category,
     pi.cost_per_lb,
@@ -47,7 +48,8 @@ LEFT JOIN (
     FROM phood_menuitem pm
     LEFT JOIN phood_station ps ON ps.id = pm.station_id
 ) s ON (pf.inventory_item_id = s.inventory_item_id AND s.location_id = pf.location_id)
-WHERE (pf.logged_time AT TIME ZONE 'UTC')::DATE = '{TARGET_DATE}'::DATE
+WHERE pf.logged_time >= '{TARGET_DATE} 00:00:00+00'::TIMESTAMPTZ
+  AND pf.logged_time < '{TARGET_DATE} 00:00:00+00'::TIMESTAMPTZ + INTERVAL '1 day'
 $template$,
     $columns$
 id INTEGER,
@@ -60,6 +62,7 @@ action_taken TEXT,
 name TEXT,
 quantity NUMERIC,
 average_weight NUMERIC,
+pan_name TEXT,
 weight NUMERIC,
 food_category TEXT,
 cost_per_lb NUMERIC,

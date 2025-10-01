@@ -138,7 +138,8 @@ CREATE OR REPLACE FUNCTION _wh.update_mv_by_template(
     tenant_connection_name text,
     target_schema text,
     target_date date DEFAULT (NOW() AT TIME ZONE 'UTC')::DATE,
-    allow_refresh_yesterday boolean DEFAULT true
+    allow_refresh_yesterday boolean DEFAULT true,
+    update_union_view boolean DEFAULT true
 )
 RETURNS boolean
 LANGUAGE plpgsql
@@ -227,6 +228,19 @@ BEGIN
             PERFORM _wh.log_error('Failed to create MV: ' || full_mv_name, context);
             RETURN FALSE;
         END IF;
+
+        -- Update union view since we created a new MV (if requested)
+        IF update_union_view THEN
+            PERFORM _wh.log_info('Updating union view after creating new MV: ' || full_mv_name, context);
+            IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+                PERFORM _wh.log_error('Failed to update union view after creating MV: ' || full_mv_name, context);
+                -- Don't fail the main operation, just log the error
+            ELSE
+                PERFORM _wh.log_info('Successfully updated union view after creating MV: ' || full_mv_name, context);
+            END IF;
+        ELSE
+            PERFORM _wh.log_info('Skipping union view update (update_union_view=false)', context);
+        END IF;
     END IF;
 
     PERFORM _wh.log_info('Successfully completed MV update for template: ' || template_name || ' date: ' || target_date, context);
@@ -239,7 +253,7 @@ END;
 $function$;
 
 -- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.update_mv_by_template(text, text, text, date, boolean) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.update_mv_by_template(text, text, text, date, boolean, boolean) TO whadmin;
 
 -- Template-based bulk update function
 CREATE OR REPLACE FUNCTION _wh.update_mv_window_by_template(
@@ -275,13 +289,14 @@ BEGIN
     -- Loop through each date in the range (inclusive)
     loop_date := start_date;
     WHILE loop_date <= end_date LOOP
-        -- Call template-based function with allow_refresh_yesterday=false
+        -- Call template-based function with allow_refresh_yesterday=false and update_union_view=false for bulk operations
         date_result := _wh.update_mv_by_template(
             template_name,
             tenant_connection_name,
             target_schema,
             loop_date,
-            false  -- allow_refresh_yesterday=false for bulk operations
+            false,  -- allow_refresh_yesterday=false for bulk operations
+            false   -- update_union_view=false for bulk operations (updated once at end)
         );
 
         -- Track results
@@ -300,6 +315,20 @@ BEGIN
         -- Move to next date
         loop_date := loop_date + INTERVAL '1 day';
     END LOOP;
+
+    -- Update union view once at the end of the window operation
+    IF success_count > 0 THEN
+        PERFORM _wh.log_info('Window operation complete - updating union view for template: ' || template_name,
+                             jsonb_build_object('schema', target_schema, 'success_count', success_count));
+        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+            PERFORM _wh.log_error('Failed to update union view after window operation',
+                                  jsonb_build_object('template', template_name, 'schema', target_schema));
+            -- Don't fail the entire operation, just log the error
+        ELSE
+            PERFORM _wh.log_info('Successfully updated union view after window operation',
+                                 jsonb_build_object('template', template_name, 'schema', target_schema));
+        END IF;
+    END IF;
 
     -- Return summary
     RETURN jsonb_build_object(
@@ -649,7 +678,7 @@ CREATE OR REPLACE FUNCTION _wh.log_info(message text, context jsonb DEFAULT '{}'
  LANGUAGE plpgsql
 AS $function$
   BEGIN
-      RAISE INFO '[WH][%] INFO: % %', NOW(), message, context;
+      RAISE INFO '[WH][%] INFO: % %', clock_timestamp(), message, context;
   END;
   $function$
 ;
@@ -659,7 +688,7 @@ CREATE OR REPLACE FUNCTION _wh.log_error(message text, context jsonb DEFAULT '{}
  LANGUAGE plpgsql
 AS $function$
   BEGIN
-      RAISE NOTICE '[WH][%] ERROR: % %', NOW(), message, context;
+      RAISE NOTICE '[WH][%] ERROR: % %', clock_timestamp(), message, context;
   END;
   $function$
 ;
@@ -670,7 +699,7 @@ CREATE OR REPLACE FUNCTION _wh.log_debug(message text, context jsonb DEFAULT '{}
 AS $function$
   BEGIN
       -- Debug messages can be commented out in production
-      RAISE DEBUG '[WH][%] DEBUG: % %', NOW(), message, context;
+      RAISE DEBUG '[WH][%] DEBUG: % %', clock_timestamp(), message, context;
   END;
   $function$
 ;
@@ -807,6 +836,7 @@ BEGIN
         WHERE viewname = template_name
         AND schemaname != 'public'
         AND schemaname != '_wh'
+        AND schemaname != 'chron'
         ORDER BY schemaname
     LOOP
         IF view_count > 0 THEN

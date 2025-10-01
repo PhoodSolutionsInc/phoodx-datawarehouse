@@ -41,24 +41,25 @@ SELECT cron.schedule(
 );
 
 
+  -- =============================================================================
+  -- NIGHTLY 2-WEEK MV REFRESH JOBS
+  -- These refresh the last 2 weeks of MVs to catch any late-arriving data
+  -- =============================================================================
 
--- =============================================================================
--- UNION VIEW UPDATE JOBS (LESS FREQUENT). Make sure that the union view update for
--- each tenant is scheduled after the daily MVs are updated.
--- =============================================================================
+  -- LandB: Daily at 3:30 AM (Central) That's 8:30 AM UTC
+  SELECT cron.schedule(
+      'landb_2week_refresh',
+      '30 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''landb-prod'', ''landb'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
 
--- Update tenant union views daily at 1 AM (after all daily MVs are updated)
-SELECT cron.schedule(
-    'union_view_update_landb',
-    '00 1 * * *',
-    'SELECT _wh.update_tenant_union_view_by_template(''foodlogstats'', ''landb'');'
-);
+  -- LandB: Daily at 3:32 AM (Central) That's 8:32 AM UTC
+  SELECT cron.schedule(
+      'mm_2week_refresh',
+      '32 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''mm-prod'', ''mm'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
 
-SELECT cron.schedule(
-    'union_view_update_mm',
-    '00 1 * * *',
-    'SELECT _wh.update_tenant_union_view_by_template(''foodlogstats'', ''mm'');'
-);
 
 -- =============================================================================
 -- YEARLY COMBINATION JOBS (ANNUAL - FEBRUARY)
