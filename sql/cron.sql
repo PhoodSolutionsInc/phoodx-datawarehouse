@@ -30,14 +30,43 @@
 SELECT cron.schedule(
     'foodlogstats_update_landb',
     '10 * * * *',
-    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''landb-prod'', ''landb'', _wh.current_date_utc());'
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''landb-prod'', ''landb'');'
 );
 
 -- MM: Every 1 hour at :11
 SELECT cron.schedule(
     'foodlogstats_update_mm',
     '11 * * * *',
-    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''mm-prod'', ''mm'', _wh.current_date_utc());'
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''mm-prod'', ''mm'');'
+);
+
+-- AF: Every 1 hour at :12
+SELECT cron.schedule(
+    'foodlogstats_update_af',
+    '12 * * * *',
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''af-prod'', ''af'');'
+);
+
+-- RB: Every 1 hour at :13
+SELECT cron.schedule(
+    'foodlogstats_update_rb',
+    '13 * * * *',
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''rb-prod'', ''rb'');'
+);
+
+-- WFMMK: Every 1 hour at :14
+SELECT cron.schedule(
+    'foodlogstats_update_wfmmk',
+    '14 * * * *',
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''wfmmk-prod'', ''wfmmk'');'
+);
+
+
+-- TK: Every 1 hour at :15
+SELECT cron.schedule(
+    'foodlogstats_update_tk',
+    '15 * * * *',
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''tk-prod'', ''tk'');'
 );
 
 
@@ -48,17 +77,47 @@ SELECT cron.schedule(
 
   -- LandB: Daily at 3:30 AM (Central) That's 8:30 AM UTC
   SELECT cron.schedule(
-      'landb_2week_refresh',
+      '2week_refresh_landb',
       '30 8 * * *',
       'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''landb-prod'', ''landb'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
   );
 
-  -- LandB: Daily at 3:32 AM (Central) That's 8:32 AM UTC
+  -- MM: Daily at 3:32 AM (Central) That's 8:32 AM UTC
   SELECT cron.schedule(
-      'mm_2week_refresh',
+      '2week_refresh_mm',
       '32 8 * * *',
       'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''mm-prod'', ''mm'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
   );
+
+  -- AF: Daily at 3:34 AM (Central) That's 8:34 AM UTC
+  SELECT cron.schedule(
+      '2week_refresh_af',
+      '34 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''af-prod'', ''af'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
+
+  -- RB: Daily at 3:36 AM (Central) That's 8:36 AM UTC
+  SELECT cron.schedule(
+      '2week_refresh_rb',
+      '36 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''rb-prod'', ''rb'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
+
+  -- WFMMK: Daily at 3:34 AM (Central) That's 8:38 AM UTC
+  SELECT cron.schedule(
+      '2week_refresh_wfmmk',
+      '36 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''wfmmk-prod'', ''wfmmk'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
+
+  -- TK: Daily at 3:34 AM (Central) That's 8:40 AM UTC
+  SELECT cron.schedule(
+      '2week_refresh_tk',
+      '40 8 * * *',
+      'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''tkf-prod'', ''tk'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+  );
+
+
 
 
 -- =============================================================================
@@ -71,18 +130,46 @@ SELECT cron.schedule(
 -- Run yearly combinations in February after year-end data is stable
 -- These jobs combine all daily MVs from the previous year into yearly tables
 
--- LandB: February 15th at 2:00 AM (CENTRAL). That's 7:00 AM UTC
+-- LandB: February 15th at 2:10 AM (CENTRAL). That's 7:10 AM UTC
 SELECT cron.schedule(
     'yearly_combination_landb',
-    '0 7 15 2 *',
+    '10 7 15 2 *',
     'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''landb'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
 );
 
--- MM: February 15th at 2:10 AM (CENTRAL) 7:10 AM UTC
+-- MM: February 15th at 2:15 AM (CENTRAL) 7:15 AM UTC
 SELECT cron.schedule(
     'yearly_combination_mm',
-    '10 7 15 2 *',
+    '15 7 15 2 *',
     'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''mm'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+);
+
+-- AF: February 15th at 2:20 AM (CENTRAL) 7:20 AM UTC
+SELECT cron.schedule(
+    'yearly_combination_af',
+    '20 7 15 2 *',
+    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''af'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+);
+
+-- RB: February 15th at 2:25 AM (CENTRAL) 7:25 AM UTC
+SELECT cron.schedule(
+    'yearly_combination_rb',
+    '25 7 15 2 *',
+    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''rb'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+);
+
+-- WFMMK: February 15th at 2:30 AM (CENTRAL) 7:30 AM UTC
+SELECT cron.schedule(
+    'yearly_combination_wfmmk',
+    '30 7 15 2 *',
+    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''wfmmk'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+);
+
+-- TK: February 15th at 2:35 AM (CENTRAL) 7:35 AM UTC
+SELECT cron.schedule(
+    'yearly_combination_tk',
+    '35 7 15 2 *',
+    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''tk'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
 );
 
 
@@ -100,7 +187,7 @@ SELECT cron.schedule(
 -- Database maintenance (analyze tables weekly)
 SELECT cron.schedule(
     'weekly_analyze',
-    '0 4 * * 0',  -- Weekly on Sunday at 4 AM
+    '10 3 * * 0',  -- Weekly on Sunday at 3:10 AM
     'ANALYZE;'
 );
 

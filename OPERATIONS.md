@@ -189,42 +189,55 @@ SELECT * FROM dblink(
 -- select MIN and MAX date value from source table. In this eg, the foodlogsum table
 select * FROM dblink(
     _wh.get_tenant_connection_string('new_tenant_connecton_name'),
-    'SELECT MIN(logged_time), MAX(logged_time) from phood_foodlogsum') 
-    as t(min_time TIMESTAMPTZ, max_time TIMESTAMPTZ)
+    'SELECT to_char(MIN(logged_time) AT TIME ZONE ''UTC'', ''YYYY-MM-DD HH24:MI:SS UTC''), to_char(MAX(logged_time) AT TIME ZONE ''UTC'', ''YYYY-MM-DD HH24:MI:SS UTC'') from phood_foodlogsum')
+    as t(min_time TEXT, max_time TEXT)
 
 ```
 
 ### Step 5: Initial Data Load (Template-Based)
 ```sql
--- Connect as whadmin user for data operations
--- Create first materialized view (current date)
-SELECT _wh.update_mv_by_template(
-    'foodlogstats',                   -- template name
-    'new_tenant_connection_name',     -- connection name
-    'new_tenant_name',               -- schema name
-    _wh.current_date_utc()
-);
 
 -- Backfill historical data (one year or less at a time). Be careful, this could put a load on the source DB.
 -- Run the window function until we're caught up to today. The reason for a year or less also depends on the 
 -- size of the source dataset.  As running this function creates one massive transaction.
+-- It's worth noting that the dates are inclusive in this function. 
+-- Also, it's OK to run this ontop of existing views, because it just re-freshes them. So, you can run overlaps
+-- and not worry.
 SELECT _wh.update_mv_window_by_template(
     'foodlogstats',                   -- template name
     'new_tenant_connection_name',     -- connection name
     'new_tenant_name',               -- schema name
-    '2024-01-01'
-    '2025-02-18'
+    '2023-01-01'
+    '2023-12-31'
 );
 
--- Create unified tenant view
+-- Create unified tenant view. Shouldn't actually be necessary, as the update by window function already does this.
 SELECT _wh.update_tenant_union_view_by_template(
     'foodlogstats',                   -- template name
     'new_tenant_connection_name',     -- connection name
     'new_tenant_name'                -- schema name
 );
 
+-- Check the year you converted for completness. This only works on the current year, and a full year of data. 
+-- A partial year will fail this check.
+select _wh.check_views_by_template_for_year(
+    'foodlogstats',         -- template name
+    'new_tenant_name'       -- schema name
+    2023                    -- year
+)
+
 -- Update public master view to include new tenant
 SELECT _wh.update_public_view_by_template('foodlogstats');
+
+-- Verify tenant data is included in public view
+SELECT schema_name, COUNT(*) as record_count
+FROM public.foodlogstats
+GROUP BY schema_name
+
+UNION ALL
+
+SELECT 'TOTAL' as schema_name, COUNT(*) as record_count
+FROM public.foodlogstats;
 ```
 
 ### Step 6: Convert Completed Years to Yearly Tables (Optional)
@@ -234,6 +247,10 @@ If your backfill included complete calendar years (not just current year), conve
 ```sql
 -- Convert completed years to yearly tables (one year at a time)
 -- Only convert years that are complete (365/366 daily MVs exist)
+-- Do NOT create last years table, if we are still in January.  
+-- This is because there is a window update function we run 
+-- in the pgcron that updates the last 2 weeks of MVs for a customer
+-- every morning at 3:00.   
 
 -- Check how many daily MVs exist for each year
 SELECT
@@ -289,8 +306,99 @@ ORDER BY year;
 **When to Convert:**
 - ✅ **Complete years only** (365/366 days of data)
 - ✅ **Historical years** (not current year)
-- ✅ **During low-usage periods** (conversion takes 30-60 minutes)
+- ✅ **During low-usage periods** (conversion takes 5-6 minutes)
 - ❌ **Skip current year** (daily updates still needed)
+
+### Step 7: Add Cron Jobs for Automated Processing
+
+Add the new tenant to the automated cron job schedule by updating `sql/cron.sql` and running the new cron commands.
+
+#### Add to Hourly Update Block
+Edit `sql/cron.sql` and add to the "DAILY MV UPDATE JOBS" section. **Space out the minutes** to avoid overloading the database:
+
+```sql
+-- Current pattern: LandB at :10, MM at :11
+-- Add new tenant at next available minute (e.g., :12)
+
+-- NewTenant: Every 1 hour at :12
+SELECT cron.schedule(
+    'foodlogstats_update_newtenant',
+    '12 * * * *',
+    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'', _wh.current_date_utc());'
+);
+```
+
+#### Add to Nightly 2-Week Refresh Block
+Add to the "NIGHTLY 2-WEEK MV REFRESH JOBS" section. **Stagger the timing** by 2+ minutes:
+
+```sql
+-- Current pattern: LandB at 8:30 UTC, MM at 8:32 UTC
+-- Add new tenant at next available time (e.g., 8:34 UTC)
+
+-- NewTenant: Daily at 3:34 AM (Central) That's 8:34 AM UTC
+SELECT cron.schedule(
+    'newtenant_2week_refresh',
+    '34 8 * * *',
+    'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+);
+```
+
+#### Add to Yearly Combination Block
+Add to the "YEARLY COMBINATION JOBS" section. **Space out by 10+ minutes** due to resource intensity:
+
+```sql
+-- Current pattern: LandB at 7:00 UTC, MM at 7:10 UTC
+-- Add new tenant at next available time (e.g., 7:20 UTC)
+
+-- NewTenant: February 15th at 2:20 AM (CENTRAL) 7:20 AM UTC
+SELECT cron.schedule(
+    'yearly_combination_newtenant',
+    '20 7 15 2 *',
+    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''new_tenant_name'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+);
+```
+
+#### Execute the New Cron Commands
+```sql
+-- Connect as whadmin user and run the new cron commands. Since existing cron entries already exist (see cron.jobs table), only run the new job select commands.
+-- (Copy the three SELECT statements above and execute them)
+
+-- Verify jobs were created
+SELECT jobid, jobname, schedule, active
+FROM cron.job
+WHERE jobname LIKE '%newtenant%'
+ORDER BY jobname;
+```
+
+#### Update Master Cron File
+Add the new tenant entries to `sql/cron.sql` so they're included in future cron deployments:
+
+1. **Edit `sql/cron.sql`**
+2. **Add the three new cron blocks** in their respective sections
+3. **Update job names** to match your tenant naming convention
+4. **Commit changes** to version control
+
+#### Timing Guidelines
+- **Hourly jobs**: Space 1-2 minutes apart (avoid conflicts)
+- **Nightly jobs**: Space 2+ minutes apart (database load management)
+- **Yearly jobs**: Space 10+ minutes apart (high resource usage)
+- **Consider tenant size**: Larger tenants may need more spacing
+
+#### Verification
+```sql
+-- Monitor first few job executions
+SELECT
+    j.jobname,
+    r.status,
+    r.start_time,
+    r.end_time,
+    r.return_message
+FROM cron.job j
+LEFT JOIN cron.job_run_details r ON j.jobid = r.jobid
+WHERE j.jobname LIKE '%newtenant%'
+AND r.start_time > NOW() - INTERVAL '24 hours'
+ORDER BY r.start_time DESC;
+```
 
 ---
 
@@ -299,39 +407,52 @@ ORDER BY year;
 ### Overview
 Temporarily disable a tenant's data processing while keeping all existing data intact. This is useful for maintenance, cost reduction, or when a tenant is temporarily inactive.
 
-### Step 1: Disable Cron Jobs
-```sql
--- Connect as whadmin user
--- List current jobs for the tenant
-SELECT jobid, jobname, schedule, active
-FROM cron.job
-WHERE jobname LIKE '%tenant_name%'
-ORDER BY jobname;
+### Step 1: Disable Cron Jobs (DBeaver GUI Method - Recommended)
 
--- Disable hourly MV updates
-UPDATE cron.job
-SET active = false
-WHERE jobname = 'foodlogstats_update_tenant_name';
+This is the easiest and safest way to disable tenant cron jobs.
 
--- Disable nightly 2-week refresh
-UPDATE cron.job
-SET active = false
-WHERE jobname = 'tenant_name_2week_refresh';
-
--- Disable yearly combination (if applicable)
-UPDATE cron.job
-SET active = false
-WHERE jobname = 'yearly_combination_tenant_name';
+#### Connect to Database via DBeaver
+```
+Host: your-warehouse.rds.amazonaws.com
+Port: 5432
+Database: postgres
+Username: whadmin
+Password: [your whadmin password]
 ```
 
+#### Navigate to Cron Jobs Table
+1. **Expand Database Tree**:
+   - `postgres` → `Schemas` → `cron` → `Tables` → `job`
+2. **Open Data Viewer**:
+   - Right-click on `job` table → `View/Edit Data` → `All Rows`
+
+#### Disable Jobs Visually
+1. **Find Tenant Jobs**:
+   - Look for `jobname` column entries containing your tenant name
+   - Example: `foodlogstats_update_tenant_name`, `tenant_name_2week_refresh`, etc.
+2. **Scroll to Active Column**:
+   - Scroll right to find the `active` column (boolean checkbox)
+3. **Uncheck Jobs**:
+   - **Uncheck the checkbox** for each tenant job you want to disable
+   - The jobs should show `false` in the `active` column
+4. **Save Changes**:
+   - Click the **Save** button at the bottom of the DBeaver data viewer
+   - DBeaver will confirm the changes were applied
+
 ### Step 2: Verify Jobs are Disabled
+
+#### Quick Visual Verification in DBeaver
+- **Check the `active` column** for your tenant jobs - should all show `false`
+- **Filter by jobname** using DBeaver's filter feature to see only your tenant jobs
+
+#### SQL Verification (Optional)
 ```sql
 -- Confirm jobs are inactive
 SELECT jobid, jobname, schedule, active
 FROM cron.job
 WHERE jobname LIKE '%tenant_name%'
-AND active = true;
--- Should return no rows
+ORDER BY jobname;
+-- All tenant jobs should show active = false
 ```
 
 ### Step 3: Optional - Document Reason
@@ -380,24 +501,35 @@ SELECT * FROM dblink(
 ) AS t(test integer);
 ```
 
-### Step 2: Re-enable Cron Jobs
-```sql
--- Connect as whadmin user
--- Re-enable hourly MV updates
-UPDATE cron.job
-SET active = true
-WHERE jobname = 'foodlogstats_update_tenant_name';
+### Step 2: Re-enable Cron Jobs (DBeaver GUI Method - Recommended)
 
--- Re-enable nightly 2-week refresh
-UPDATE cron.job
-SET active = true
-WHERE jobname = 'tenant_name_2week_refresh';
-
--- Re-enable yearly combination (if applicable)
-UPDATE cron.job
-SET active = true
-WHERE jobname = 'yearly_combination_tenant_name';
+#### Connect to Database via DBeaver
 ```
+Host: your-warehouse.rds.amazonaws.com
+Port: 5432
+Database: postgres
+Username: whadmin
+Password: [your whadmin password]
+```
+
+#### Navigate to Cron Jobs Table
+1. **Expand Database Tree**:
+   - `postgres` → `Schemas` → `cron` → `Tables` → `job`
+2. **Open Data Viewer**:
+   - Right-click on `job` table → `View/Edit Data` → `All Rows`
+
+#### Re-enable Jobs Visually
+1. **Find Disabled Tenant Jobs**:
+   - Look for your tenant jobs with `active = false`
+   - Filter by `jobname` containing your tenant name if needed
+2. **Check the Active Column**:
+   - Scroll right to find the `active` column (boolean checkbox)
+3. **Check Jobs**:
+   - **Check the checkbox** for each tenant job you want to re-enable
+   - The jobs should show `true` in the `active` column
+4. **Save Changes**:
+   - Click the **Save** button at the bottom of the DBeaver data viewer
+   - DBeaver will confirm the changes were applied
 
 ### Step 3: Backfill Missing Data
 ```sql

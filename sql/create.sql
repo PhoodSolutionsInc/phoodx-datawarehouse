@@ -112,8 +112,8 @@ CREATE TABLE _wh.tenant_connections (
 	dbname text NOT NULL,
 	username text NOT NULL,
 	"password" text NOT NULL,
-	created_at timestamp DEFAULT now() NULL,
-	updated_at timestamp DEFAULT now() NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz DEFAULT now() NULL,
 	CONSTRAINT tenant_connections_pkey PRIMARY KEY (tenant_name)
 );
 
@@ -124,8 +124,8 @@ CREATE TABLE _wh.mv_templates (
 	query_template text NOT NULL,
 	column_definitions text NOT NULL,
 	indexes text,
-	created_at timestamp DEFAULT now() NULL,
-	updated_at timestamp DEFAULT now() NULL,
+	created_at timestamptz DEFAULT now() NULL,
+	updated_at timestamptz DEFAULT now() NULL,
 	CONSTRAINT mv_templates_pkey PRIMARY KEY (template_name)
 );
 

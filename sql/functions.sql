@@ -314,6 +314,9 @@ BEGIN
 
         -- Move to next date
         loop_date := loop_date + INTERVAL '1 day';
+
+        -- Pause to avoid overwhelming source database
+        PERFORM pg_sleep(1);
     END LOOP;
 
     -- Update union view once at the end of the window operation
