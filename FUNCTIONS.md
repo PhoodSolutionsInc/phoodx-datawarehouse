@@ -8,25 +8,33 @@ This document provides detailed reference for all `_wh` schema functions in the 
   - [_wh.mv_create_from_template](#_whmv_create_from_template)
   - [_wh.mv_update_by_template](#_whmv_update_by_template)
   - [_wh.mv_update_window_by_template](#_whmv_update_window_by_template)
-- [Union View Functions](#union-view-functions)
-  - [_wh.union_view_update_tenant_by_template](#_whunion_view_update_tenant_by_template)
-  - [_wh.union_view_update_public_by_template](#_whunion_view_update_public_by_template)
-- [Year Table Functions](#year-table-functions)
-  - [_wh.year_table_create_combined_from_template](#_whyear_table_create_combined_from_template)
-  - [_wh.year_table_get_combined_view_by_template](#_whyear_table_get_combined_view_by_template)
-  - [_wh.year_table_check_views_by_template_for_year](#_whyear_table_check_views_by_template_for_year)
-- [Schema Modification Functions](#schema-modification-functions)
-  - [_wh.schema_add_column_to_template](#_whschema_add_column_to_template)
-  - [_wh.schema_add_column_to_all_mvs](#_whschema_add_column_to_all_mvs)
-  - [_wh.schema_add_column_to_union_views](#_whschema_add_column_to_union_views)
-- [Utility Functions](#utility-functions)
   - [_wh.mv_create_name](#_whmv_create_name)
   - [_wh.mv_does_exist](#_whmv_does_exist)
   - [_wh.mv_refresh](#_whmv_refresh)
+  - [_wh.mv_drop_current_year_by_template](#_whmv_drop_current_year_by_template)
+- [Union View Functions](#union-view-functions)
+  - [_wh.union_view_update_tenant_by_template](#_whunion_view_update_tenant_by_template)
+  - [_wh.union_view_update_public_by_template](#_whunion_view_update_public_by_template)
+  - [_wh.union_view_drop_public_by_template](#_whunion_view_drop_public_by_template)
+  - [_wh.union_view_drop_all_by_template](#_whunion_view_drop_all_by_template)
+- [Year Table Functions](#year-table-functions)
+  - [_wh.year_table_create_from_template](#_whyear_table_create_from_template)
+  - [_wh.year_table_get_combined_view_by_template](#_whyear_table_get_combined_view_by_template)
+  - [_wh.year_table_check_views_by_template](#_whyear_table_check_views_by_template)
+  - [_wh.year_table_add_column_by_template](#_whyear_table_add_column_by_template)
+- [Utility Functions](#utility-functions)
   - [_wh.util_get_tenant_connection_string](#_whutil_get_tenant_connection_string)
   - [_wh.util_current_date_utc](#_whutil_current_date_utc)
 - [Logging Functions](#logging-functions)
   - [_wh.log_info, _wh.log_error, _wh.log_debug](#_whlog_helpers)
+- [Cron Wrapper Functions](#cron-wrapper-functions)
+  - [_wh.cron_refresh_today](#_whcron_refresh_today)
+  - [_wh.cron_refresh_recent](#_whcron_refresh_recent)
+  - [_wh.cron_combine_last_year](#_whcron_combine_last_year)
+- [Schema Modification Functions](#schema-modification-functions)
+  - [_wh.schema_add_column_to_template](#_whschema_add_column_to_template)
+  - [_wh.schema_add_column_to_all_mvs](#_whschema_add_column_to_all_mvs)
+  - [_wh.schema_add_column_to_union_views](#_whschema_add_column_to_union_views)
 
 ---
 
@@ -212,6 +220,56 @@ SELECT _wh.union_view_update_public_by_template('foodlogstats');
 -- Creates: public.foodlogstats (with schema_name column)
 ```
 
+### _wh.union_view_drop_public_by_template
+
+Drops the public master view for a template.
+
+**Signature:**
+```sql
+_wh.union_view_drop_public_by_template(template_name text) RETURNS boolean
+```
+
+**Parameters:**
+- `template_name`: Name of the template (e.g., 'foodlogstats')
+
+**Returns:** `TRUE` on success, `FALSE` on failure
+
+**What it does:**
+1. Drops the public view `public.{template_name}`
+2. Provides logging for the operation
+
+**Example:**
+```sql
+SELECT _wh.union_view_drop_public_by_template('foodlogstats');
+-- Drops: public.foodlogstats
+```
+
+### _wh.union_view_drop_all_by_template
+
+Drops all union views (both tenant and public) for a template.
+
+**Signature:**
+```sql
+_wh.union_view_drop_all_by_template(template_name text) RETURNS jsonb
+```
+
+**Parameters:**
+- `template_name`: Name of the template (e.g., 'foodlogstats')
+
+**Returns:** JSON object with operation results
+
+**What it does:**
+1. Finds all schemas with tenant union views
+2. Drops each tenant union view
+3. Drops the public master view
+4. Returns detailed statistics
+
+**Example:**
+```sql
+SELECT _wh.union_view_drop_all_by_template('foodlogstats');
+-- Drops all tenant and public views for template
+```
+
 
 ## Year Table Functions
 
@@ -276,13 +334,13 @@ SELECT _wh.year_table_get_combined_view_by_template('foodlogstats', 'landb', 202
 -- Returns: "CREATE TABLE landb.foodlogstats_2024 AS SELECT * FROM landb.foodlogstats_2024_01_01 UNION ALL..."
 ```
 
-### _wh.year_table_check_views_by_template_for_year
+### _wh.year_table_check_views_by_template
 
 Checks data integrity and completeness for all MVs in a specific year.
 
 **Signature:**
 ```sql
-_wh.year_table_check_views_by_template_for_year(
+_wh.year_table_check_views_by_template(
     template_name text,
     target_schema text,
     target_year integer
@@ -305,7 +363,7 @@ _wh.year_table_check_views_by_template_for_year(
 
 **Example:**
 ```sql
-SELECT _wh.year_table_check_views_by_template_for_year('foodlogstats', 'landb', 2024);
+SELECT _wh.year_table_check_views_by_template('foodlogstats', 'landb', 2024);
 ```
 
 **Return Example:**
@@ -321,6 +379,48 @@ SELECT _wh.year_table_check_views_by_template_for_year('foodlogstats', 'landb', 
   "avg_daily_records": 3431,
   "data_quality_flags": []
 }
+```
+
+### _wh.year_table_add_column_by_template
+
+Adds a column to all yearly tables for a specific template.
+
+**Signature:**
+```sql
+_wh.year_table_add_column_by_template(
+    template_name text,
+    column_name text,
+    column_type text,
+    default_value text DEFAULT NULL,
+    create_index boolean DEFAULT false
+) RETURNS jsonb
+```
+
+**Parameters:**
+- `template_name`: Name of the template
+- `column_name`: Name of the column to add
+- `column_type`: PostgreSQL column type (e.g., 'TEXT', 'INTEGER')
+- `default_value`: Default value for existing records
+- `create_index`: Whether to create an index on the new column
+
+**Returns:** JSON object with operation results
+
+**What it does:**
+1. Finds all yearly tables matching the template pattern
+2. Adds the column to each yearly table using `ALTER TABLE`
+3. Sets default values if specified
+4. Creates indexes if requested
+5. Returns detailed statistics
+
+**Example:**
+```sql
+SELECT _wh.year_table_add_column_by_template(
+    'foodlogstats',
+    'waste_category',
+    'TEXT',
+    'unknown',
+    true
+);
 ```
 
 ## Schema Modification Functions
@@ -439,8 +539,6 @@ SELECT _wh.schema_add_column_to_union_views('foodlogstats');
 
 ---
 
-## Utility Functions
-
 ### _wh.mv_create_name
 
 Generates standardized materialized view names with date suffixes.
@@ -466,7 +564,6 @@ SELECT _wh.mv_create_name('foodlogstats', '2024-01-15'::date);
 SELECT _wh.mv_create_name('inventory_stats', _wh.util_current_date_utc());
 -- Returns: 'inventory_stats_2024_01_15' (if today is 2024-01-15 UTC)
 ```
-
 
 ### _wh.mv_does_exist
 
@@ -531,7 +628,37 @@ END IF;
 
 **Note:** Requires the materialized view to have a unique index for concurrent refresh.
 
-**Backward Compatibility:** `_wh.refresh_mv` → `_wh.mv_refresh`
+### _wh.mv_drop_current_year_by_template
+
+Drops all materialized views for the current year for a specific template.
+
+**Signature:**
+```sql
+_wh.mv_drop_current_year_by_template(
+    template_name text,
+    target_year integer DEFAULT EXTRACT(YEAR FROM _wh.util_current_date_utc())::integer
+) RETURNS jsonb
+```
+
+**Parameters:**
+- `template_name`: Name of the template
+- `target_year`: Year to drop MVs for (defaults to current year)
+
+**Returns:** JSON object with operation results
+
+**What it does:**
+1. Finds all MVs matching the template and year pattern
+2. Drops each MV individually with error handling
+3. Returns detailed statistics about the operation
+
+**Example:**
+```sql
+SELECT _wh.mv_drop_current_year_by_template('foodlogstats', 2024);
+```
+
+---
+
+## Utility Functions
 
 ### _wh.util_get_tenant_connection_string
 
@@ -888,7 +1015,7 @@ SELECT _wh.cron_combine_last_year('foodlogstats', 'landb');
 SELECT _wh.year_table_create_combined_from_template('foodlogstats', 'landb', 2024);
 
 -- Check data integrity for a year
-SELECT _wh.year_table_check_views_by_template_for_year('foodlogstats', 'landb', 2024);
+SELECT _wh.year_table_check_views_by_template('foodlogstats', 'landb', 2024);
 ```
 
 **Schema Modifications:**
