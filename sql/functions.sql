@@ -3,13 +3,149 @@
 -- =============================================================================
 -- This file contains all warehouse management functions.
 -- Run this script after initial database setup with create.sql
+--
+-- NAMING CONVENTION: Functions use domain-first naming for better organization:
+-- - mv_* : Materialized view operations
+-- - union_view_* : Union view management
+-- - year_table_* : Yearly table operations
+-- - util_* : Utility functions
+-- - log_* : Logging functions
+
 
 -- =============================================================================
--- GENERIC TEMPLATE-BASED FUNCTIONS
+-- UTILITY FUNCTIONS
 -- =============================================================================
 
--- Generic materialized view creation from template
-CREATE OR REPLACE FUNCTION _wh.create_mv_from_template(
+-- Generate standardized MV names
+CREATE OR REPLACE FUNCTION _wh.mv_create_name(mvname text, target_date date)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+AS $function$
+BEGIN
+    RETURN mvname || '_' || TO_CHAR(target_date, 'YYYY_MM_DD');
+END;
+$function$;
+
+-- Get current UTC date with optional day offset
+CREATE OR REPLACE FUNCTION _wh.util_current_date_utc(interval_offset integer DEFAULT 0)
+RETURNS date
+LANGUAGE sql
+STABLE
+AS $function$
+    SELECT ((NOW() AT TIME ZONE 'UTC') + (interval_offset || ' days')::INTERVAL)::DATE;
+$function$;
+
+-- Check if materialized view exists
+CREATE OR REPLACE FUNCTION _wh.mv_does_exist(target_schema text, view_name text)
+RETURNS boolean
+LANGUAGE plpgsql
+STABLE
+AS $function$
+BEGIN
+    RETURN EXISTS (
+        SELECT 1
+        FROM pg_matviews
+        WHERE schemaname = target_schema
+        AND matviewname = view_name
+    );
+END;
+$function$;
+
+-- Get tenant connection string (SECURITY DEFINER for controlled access)
+CREATE OR REPLACE FUNCTION _wh.util_get_tenant_connection_string(tenant_name text)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+AS $function$
+DECLARE
+    conn_record RECORD;
+BEGIN
+    SELECT host, port, dbname, username, password
+    INTO conn_record
+    FROM _wh.tenant_connections
+    WHERE tenant_connections.tenant_name = util_get_tenant_connection_string.tenant_name;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Tenant connection not found: %', tenant_name;
+    END IF;
+
+    RETURN format('host=%s port=%s dbname=%s user=%s password=%s',
+                  conn_record.host,
+                  conn_record.port,
+                  conn_record.dbname,
+                  conn_record.username,
+                  conn_record.password);
+END;
+$function$;
+
+-- Refresh materialized view
+CREATE OR REPLACE FUNCTION _wh.mv_refresh(target_schema text, view_name text)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $function$
+DECLARE
+    context JSONB;
+BEGIN
+    context := jsonb_build_object('schema', target_schema, 'view', view_name);
+
+    BEGIN
+        EXECUTE format('REFRESH MATERIALIZED VIEW CONCURRENTLY %I.%I', target_schema, view_name);
+        PERFORM _wh.log_info('Refreshed materialized view: ' || target_schema || '.' || view_name, context);
+        RETURN TRUE;
+    EXCEPTION
+        WHEN OTHERS THEN
+            PERFORM _wh.log_error('Failed to refresh materialized view: ' || target_schema || '.' || view_name || ' - ' || SQLERRM, context);
+            RETURN FALSE;
+    END;
+END;
+$function$;
+
+-- =============================================================================
+-- LOGGING FUNCTIONS
+-- =============================================================================
+
+-- Info logging
+CREATE OR REPLACE FUNCTION _wh.log_info(message text, context jsonb DEFAULT '{}'::jsonb)
+ RETURNS void
+ LANGUAGE plpgsql
+AS $function$
+  BEGIN
+      RAISE INFO '[WH][%] INFO: % %', clock_timestamp(), message, context;
+  END;
+  $function$
+;
+
+-- Error logging
+CREATE OR REPLACE FUNCTION _wh.log_error(message text, context jsonb DEFAULT '{}'::jsonb)
+ RETURNS void
+ LANGUAGE plpgsql
+AS $function$
+  BEGIN
+      RAISE NOTICE '[WH][%] ERROR: % %', clock_timestamp(), message, context;
+  END;
+  $function$
+;
+
+-- Debug logging
+CREATE OR REPLACE FUNCTION _wh.log_debug(message text, context jsonb DEFAULT '{}'::jsonb)
+ RETURNS void
+ LANGUAGE plpgsql
+AS $function$
+  BEGIN
+      -- Debug messages can be commented out in production
+      RAISE DEBUG '[WH][%] DEBUG: % %', clock_timestamp(), message, context;
+  END;
+  $function$
+;
+
+-- =============================================================================
+-- MV TEMPLATE OPERATIONS
+-- =============================================================================
+
+-- Create materialized view from template
+CREATE OR REPLACE FUNCTION _wh.mv_create_from_template(
     template_name text,
     tenant_connection_name text,
     target_schema text,
@@ -29,7 +165,7 @@ DECLARE
     context JSONB;
 BEGIN
     -- Generate the full view name internally
-    view_name := _wh.create_mv_name(template_name, target_date);
+    view_name := _wh.mv_create_name(template_name, target_date);
 
     -- Setup context for logging
     context := jsonb_build_object(
@@ -44,96 +180,70 @@ BEGIN
     BEGIN
         SELECT * INTO template_data
         FROM _wh.mv_templates
-        WHERE mv_templates.template_name = create_mv_from_template.template_name;
+        WHERE mv_templates.template_name = mv_create_from_template.template_name;
 
         IF NOT FOUND THEN
             PERFORM _wh.log_error('Template not found: ' || template_name, context);
             RETURN FALSE;
         END IF;
-
-        PERFORM _wh.log_debug('Found template: ' || template_name, context);
     EXCEPTION
         WHEN OTHERS THEN
-            PERFORM _wh.log_error('Failed to get template: ' || template_name || ' - ' || SQLERRM, context);
+            PERFORM _wh.log_error('Error accessing template: ' || SQLERRM, context);
             RETURN FALSE;
     END;
 
     -- Get connection string
     BEGIN
-        connection_string := _wh.get_tenant_connection_string(tenant_connection_name);
-        PERFORM _wh.log_debug('Got connection string for tenant: ' || tenant_connection_name, context);
+        connection_string := _wh.util_get_tenant_connection_string(tenant_connection_name);
     EXCEPTION
         WHEN OTHERS THEN
-            PERFORM _wh.log_error('Failed to get connection string for tenant: ' || tenant_connection_name || ' - ' || SQLERRM, context);
+            PERFORM _wh.log_error('Failed to get connection string: ' || SQLERRM, context);
             RETURN FALSE;
     END;
 
     full_mv_name := target_schema || '.' || view_name;
 
-    PERFORM _wh.log_info('Creating MV: ' || full_mv_name || ' for date: ' || target_date, context);
+    -- Build the remote query by substituting variables
+    remote_query := REPLACE(template_data.query_template, '{TARGET_DATE}', target_date::text);
 
-    -- Substitute placeholders in template query (only TARGET_DATE now)
-    remote_query := template_data.query_template;
-    remote_query := replace(remote_query, '{TARGET_DATE}', target_date::text);
-
-    -- Check if MV already exists
-    IF _wh.does_mv_exist(target_schema, view_name) THEN
-        PERFORM _wh.log_info('MV already exists, skipping: ' || full_mv_name, context);
-        RETURN TRUE;
-    END IF;
-
-    -- Create the materialized view using dblink
-    create_sql := format(
-        'CREATE MATERIALIZED VIEW %I.%I AS SELECT * FROM dblink(%L, %L) AS t(%s)',
-        target_schema,
-        view_name,
-        connection_string,
-        remote_query,
-        template_data.column_definitions
-    );
-
+    -- Build and execute the CREATE MATERIALIZED VIEW statement
     BEGIN
+        create_sql := format('CREATE MATERIALIZED VIEW %I.%I AS SELECT * FROM dblink(%L, %L) AS t(%s)',
+                           target_schema, view_name, connection_string, remote_query, template_data.column_definitions);
+
         EXECUTE create_sql;
-        PERFORM _wh.log_info('Successfully created MV: ' || full_mv_name, context);
+        PERFORM _wh.log_info('Created materialized view: ' || full_mv_name, context);
 
-        -- Set ownership to whadmin
-        EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO whadmin', target_schema, view_name);
-
-        -- Grant public select access
-        EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, view_name);
-
-        -- Create indexes if defined
-        IF template_data.indexes IS NOT NULL AND length(trim(template_data.indexes)) > 0 THEN
+        -- Create indexes using template
+        IF template_data.indexes IS NOT NULL AND template_data.indexes != '' THEN
             DECLARE
                 index_sql TEXT;
+                final_index_sql TEXT;
             BEGIN
-                index_sql := template_data.indexes;
-                index_sql := replace(index_sql, '{SCHEMA}', target_schema);
-                index_sql := replace(index_sql, '{VIEW_NAME}', view_name);
+                -- Substitute placeholders in index definitions
+                index_sql := REPLACE(template_data.indexes, '{SCHEMA}', target_schema);
+                final_index_sql := REPLACE(index_sql, '{VIEW_NAME}', view_name);
 
-                EXECUTE index_sql;
-                PERFORM _wh.log_debug('Created indexes for MV: ' || full_mv_name, context);
+                EXECUTE final_index_sql;
+                PERFORM _wh.log_info('Created indexes for: ' || full_mv_name, context);
             EXCEPTION
                 WHEN OTHERS THEN
-                    PERFORM _wh.log_error('Failed to create indexes for MV: ' || full_mv_name || ' - ' || SQLERRM, context);
-                    -- Don't fail the entire operation for index creation issues
+                    PERFORM _wh.log_error('Failed to create indexes for: ' || full_mv_name || ' - ' || SQLERRM, context);
+                    -- Don't fail the entire operation for index creation failures
             END;
         END IF;
 
         RETURN TRUE;
     EXCEPTION
         WHEN OTHERS THEN
-            PERFORM _wh.log_error('Failed to create MV: ' || full_mv_name || ' - ' || SQLERRM, context);
+            PERFORM _wh.log_error('Failed to create materialized view: ' || full_mv_name || ' - ' || SQLERRM, context);
             RETURN FALSE;
     END;
 END;
 $function$;
 
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.create_mv_from_template(text, text, text, date) TO whadmin;
-
--- Generic materialized view update from template
-CREATE OR REPLACE FUNCTION _wh.update_mv_by_template(
+-- Update materialized view by template (main workhorse function)
+CREATE OR REPLACE FUNCTION _wh.mv_update_by_template(
     template_name text,
     tenant_connection_name text,
     target_schema text,
@@ -154,8 +264,9 @@ DECLARE
     target_mv_exists BOOLEAN;
 BEGIN
     -- Generate the full view name internally
-    view_name := _wh.create_mv_name(template_name, target_date);
+    view_name := _wh.mv_create_name(template_name, target_date);
     full_mv_name := target_schema || '.' || view_name;
+    yesterday_date := target_date - INTERVAL '1 day';
 
     -- Setup context for logging
     context := jsonb_build_object(
@@ -164,66 +275,47 @@ BEGIN
         'schema', target_schema,
         'view_name', view_name,
         'target_date', target_date,
-        'allow_refresh_yesterday', allow_refresh_yesterday
+        'allow_refresh_yesterday', allow_refresh_yesterday,
+        'update_union_view', update_union_view
     );
 
     PERFORM _wh.log_info('Starting MV update for template: ' || template_name || ' date: ' || target_date, context);
 
-    -- STEP 1: Check if target MV already exists
-    target_mv_exists := _wh.does_mv_exist(target_schema, view_name);
-    PERFORM _wh.log_info('Target MV exists: ' || target_mv_exists || ', allow_refresh_yesterday: ' || allow_refresh_yesterday, context);
-
-    -- STEP 2: If creating NEW MV and allow_refresh_yesterday is true, refresh previous day FIRST
-    IF allow_refresh_yesterday AND NOT target_mv_exists THEN
-        PERFORM _wh.log_info('Creating new MV - will refresh previous day first', context);
-        yesterday_date := target_date - INTERVAL '1 day';
+    -- Phase 1: Refresh yesterday's MV if requested and exists
+    IF allow_refresh_yesterday THEN
         DECLARE
             yesterday_view_name TEXT;
-            yesterday_full_mv_name TEXT;
-            yesterday_context JSONB;
         BEGIN
-            yesterday_view_name := _wh.create_mv_name(template_name, yesterday_date);
-            yesterday_full_mv_name := target_schema || '.' || yesterday_view_name;
+            yesterday_view_name := _wh.mv_create_name(template_name, yesterday_date);
 
-            yesterday_context := jsonb_build_object(
-                'template', template_name,
-                'tenant', tenant_connection_name,
-                'schema', target_schema,
-                'view_name', yesterday_view_name,
-                'target_date', yesterday_date,
-                'parent_operation', 'refresh_previous_before_create'
-            );
-
-            IF _wh.does_mv_exist(target_schema, yesterday_view_name) THEN
-                PERFORM _wh.log_info('Refreshing previous day MV before creating new MV: ' || yesterday_full_mv_name, yesterday_context);
-                refresh_result := _wh.refresh_mv(target_schema, yesterday_view_name);
+            IF _wh.mv_does_exist(target_schema, yesterday_view_name) THEN
+                PERFORM _wh.log_info('Refreshing yesterday MV: ' || yesterday_view_name, context);
+                refresh_result := _wh.mv_refresh(target_schema, yesterday_view_name);
                 IF NOT refresh_result THEN
-                    PERFORM _wh.log_error('Failed to refresh previous day MV: ' || yesterday_full_mv_name, yesterday_context);
-                    -- Don't fail the main operation for previous day refresh issues
+                    PERFORM _wh.log_error('Failed to refresh yesterday MV: ' || yesterday_view_name, context);
+                    -- Continue anyway - don't fail entire operation
                 END IF;
             ELSE
-                PERFORM _wh.log_info('Previous day MV does not exist, skipping refresh: ' || yesterday_full_mv_name, yesterday_context);
+                PERFORM _wh.log_info('Yesterday MV does not exist, skipping refresh: ' || yesterday_view_name, context);
             END IF;
         END;
-    ELSE
-        IF target_mv_exists THEN
-            PERFORM _wh.log_info('Target MV exists - skipping previous day refresh', context);
-        ELSE
-            PERFORM _wh.log_info('allow_refresh_yesterday is false - skipping previous day refresh', context);
-        END IF;
     END IF;
 
-    -- STEP 3: Create or refresh the target MV
+    -- Phase 2: Handle target date MV
+    target_mv_exists := _wh.mv_does_exist(target_schema, view_name);
+
     IF target_mv_exists THEN
-        PERFORM _wh.log_info('Target MV exists, refreshing: ' || full_mv_name, context);
-        refresh_result := _wh.refresh_mv(target_schema, view_name);
+        -- Refresh existing MV
+        PERFORM _wh.log_info('Refreshing existing MV: ' || full_mv_name, context);
+        refresh_result := _wh.mv_refresh(target_schema, view_name);
         IF NOT refresh_result THEN
             PERFORM _wh.log_error('Failed to refresh MV: ' || full_mv_name, context);
             RETURN FALSE;
         END IF;
     ELSE
-        PERFORM _wh.log_info('Target MV does not exist, creating: ' || full_mv_name, context);
-        refresh_result := _wh.create_mv_from_template(template_name, tenant_connection_name, target_schema, target_date);
+        -- Create new MV
+        PERFORM _wh.log_info('Creating new MV: ' || full_mv_name, context);
+        refresh_result := _wh.mv_create_from_template(template_name, tenant_connection_name, target_schema, target_date);
         IF NOT refresh_result THEN
             PERFORM _wh.log_error('Failed to create MV: ' || full_mv_name, context);
             RETURN FALSE;
@@ -232,7 +324,7 @@ BEGIN
         -- Update union view since we created a new MV (if requested)
         IF update_union_view THEN
             PERFORM _wh.log_info('Updating union view after creating new MV: ' || full_mv_name, context);
-            IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+            IF NOT _wh.union_view_update_tenant_by_template(template_name, target_schema) THEN
                 PERFORM _wh.log_error('Failed to update union view after creating MV: ' || full_mv_name, context);
                 -- Don't fail the main operation, just log the error
             ELSE
@@ -247,16 +339,13 @@ BEGIN
     RETURN TRUE;
 EXCEPTION
     WHEN OTHERS THEN
-        PERFORM _wh.log_error('Error in update_mv_by_template: ' || SQLERRM, context);
+        PERFORM _wh.log_error('Error in mv_update_by_template: ' || SQLERRM, context);
         RETURN FALSE;
 END;
 $function$;
 
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.update_mv_by_template(text, text, text, date, boolean, boolean) TO whadmin;
-
--- Template-based bulk update function
-CREATE OR REPLACE FUNCTION _wh.update_mv_window_by_template(
+-- Bulk update MVs for date range
+CREATE OR REPLACE FUNCTION _wh.mv_update_window_by_template(
     template_name text,
     tenant_connection_name text,
     target_schema text,
@@ -282,7 +371,7 @@ BEGIN
     END IF;
 
     -- Validate template exists
-    IF NOT EXISTS (SELECT 1 FROM _wh.mv_templates WHERE mv_templates.template_name = update_mv_window_by_template.template_name) THEN
+    IF NOT EXISTS (SELECT 1 FROM _wh.mv_templates WHERE mv_templates.template_name = mv_update_window_by_template.template_name) THEN
         RAISE EXCEPTION 'Template not found: %', template_name;
     END IF;
 
@@ -290,7 +379,7 @@ BEGIN
     loop_date := start_date;
     WHILE loop_date <= end_date LOOP
         -- Call template-based function with allow_refresh_yesterday=false and update_union_view=false for bulk operations
-        date_result := _wh.update_mv_by_template(
+        date_result := _wh.mv_update_by_template(
             template_name,
             tenant_connection_name,
             target_schema,
@@ -323,7 +412,7 @@ BEGIN
     IF success_count > 0 THEN
         PERFORM _wh.log_info('Window operation complete - updating union view for template: ' || template_name,
                              jsonb_build_object('schema', target_schema, 'success_count', success_count));
-        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+        IF NOT _wh.union_view_update_tenant_by_template(template_name, target_schema) THEN
             PERFORM _wh.log_error('Failed to update union view after window operation',
                                   jsonb_build_object('template', template_name, 'schema', target_schema));
             -- Don't fail the entire operation, just log the error
@@ -350,49 +439,88 @@ EXCEPTION
     WHEN OTHERS THEN
         RETURN jsonb_build_object(
             'error', SQLERRM,
-            'success', false,
             'template_name', template_name,
             'tenant', tenant_connection_name,
-            'schema', target_schema
+            'schema', target_schema,
+            'start_date', start_date,
+            'end_date', end_date,
+            'success_count', success_count,
+            'error_count', error_count,
+            'duration_seconds', EXTRACT(EPOCH FROM (NOW() - start_time))
         );
 END;
 $function$;
 
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.update_mv_window_by_template(text, text, text, date, date) TO whadmin;
-
 -- =============================================================================
--- UTILITY FUNCTIONS
+-- YEAR TABLE OPERATIONS
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION _wh.create_mv_name(mvname text, target_date date)
- RETURNS text
- LANGUAGE plpgsql
+-- Check views by template for a specific year
+CREATE OR REPLACE FUNCTION _wh.year_table_check_views_by_template(
+    template_name text,
+    target_schema text,
+    target_year integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
 AS $function$
-  BEGIN
-      RETURN mvname || '_' || to_char(target_date, 'YYYY_MM_DD');
-  END;
-  $function$
-;
+DECLARE
+    start_date DATE;
+    end_date DATE;
+    expected_days INTEGER;
+    actual_mvs INTEGER;
+    missing_dates TEXT[] := '{}';
+    loop_date DATE;
+    view_name TEXT;
+    context JSONB;
+BEGIN
+    context := jsonb_build_object(
+        'template', template_name,
+        'schema', target_schema,
+        'year', target_year
+    );
 
-ALTER FUNCTION _wh.create_mv_name(text, date) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.create_mv_name(text, date) TO whadmin;
+    -- Calculate expected date range for the year
+    start_date := (target_year || '-01-01')::DATE;
+    end_date := (target_year || '-12-31')::DATE;
+    expected_days := end_date - start_date + 1;
 
-CREATE OR REPLACE FUNCTION _wh.current_date_utc()
- RETURNS date
- LANGUAGE plpgsql
-AS $function$
-  BEGIN
-      RETURN (NOW() AT TIME ZONE 'UTC')::DATE;
-  END;
-  $function$
-;
+    -- Count actual MVs for the year
+    SELECT COUNT(*)
+    INTO actual_mvs
+    FROM pg_matviews
+    WHERE schemaname = target_schema
+    AND matviewname LIKE template_name || '_' || target_year || '_%';
 
-ALTER FUNCTION _wh.current_date_utc() OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.current_date_utc() TO whadmin;
+    -- Find missing dates if not all days are present
+    IF actual_mvs < expected_days THEN
+        loop_date := start_date;
+        WHILE loop_date <= end_date LOOP
+            view_name := _wh.mv_create_name(template_name, loop_date);
 
--- Check for missing or stale MVs/yearly tables for a given template and year
-CREATE OR REPLACE FUNCTION _wh.check_views_by_template_for_year(
+            IF NOT _wh.mv_does_exist(target_schema, view_name) THEN
+                missing_dates := array_append(missing_dates, loop_date::text);
+            END IF;
+
+            loop_date := loop_date + INTERVAL '1 day';
+        END LOOP;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'template_name', template_name,
+        'schema', target_schema,
+        'year', target_year,
+        'expected_days', expected_days,
+        'actual_mvs', actual_mvs,
+        'missing_count', array_length(missing_dates, 1),
+        'missing_dates', missing_dates,
+        'complete', (actual_mvs = expected_days)
+    );
+END;
+$function$;
+
+-- Create combined yearly table from daily MVs
+CREATE OR REPLACE FUNCTION _wh.year_table_create_from_template(
     template_name text,
     target_schema text,
     target_year integer
@@ -402,641 +530,110 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 AS $function$
 DECLARE
+    template_data RECORD;
     yearly_table_name TEXT;
-    yearly_table_exists BOOLEAN := FALSE;
-    expected_days INTEGER;
-    existing_mvs INTEGER := 0;
-    missing_mvs INTEGER := 0;
-    stale_mvs INTEGER := 0;
-    issues JSONB := '[]'::JSONB;
-    results JSONB;
-    context JSONB;
+    full_table_name TEXT;
     mv_record RECORD;
-    check_date DATE;
-    expected_mv_name TEXT;
-    mv_exists BOOLEAN;
-BEGIN
-    yearly_table_name := template_name || '_' || target_year::text;
-
-    context := jsonb_build_object(
-        'template_name', template_name,
-        'target_schema', target_schema,
-        'target_year', target_year,
-        'yearly_table_name', yearly_table_name
-    );
-
-    PERFORM _wh.log_info('Checking data integrity for template: ' || template_name || ' year: ' || target_year, context);
-
-    -- Check if yearly table exists
-    SELECT EXISTS (
-        SELECT 1 FROM pg_tables
-        WHERE schemaname = target_schema
-        AND tablename = yearly_table_name
-    ) INTO yearly_table_exists;
-
-    -- Calculate expected days for the year
-    IF target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN
-        -- Current year: only expect MVs up to current date
-        expected_days := EXTRACT(DOY FROM _wh.current_date_utc())::INTEGER;
-    ELSE
-        -- Past/future year: use full year calculation
-        expected_days := (DATE (target_year || '-12-31') - DATE (target_year || '-01-01') + 1)::INTEGER;
-    END IF;
-
-    -- Count existing daily MVs for the year
-    SELECT COUNT(*) INTO existing_mvs
-    FROM pg_matviews
-    WHERE schemaname = target_schema
-    AND matviewname LIKE template_name || '_' || target_year::text || '_%';
-
-    -- SCENARIO 1: Yearly table exists
-    IF yearly_table_exists THEN
-        IF existing_mvs > 0 THEN
-            -- Issue: Yearly table exists but daily MVs still present (stale MVs)
-            stale_mvs := existing_mvs;
-            issues := issues || jsonb_build_object(
-                'issue_type', 'STALE_MVS_WITH_YEARLY_TABLE',
-                'severity', 'HIGH',
-                'description', 'Yearly table exists but ' || existing_mvs || ' daily MVs remain',
-                'recommendation', 'Drop stale daily MVs or re-run yearly combination',
-                'stale_mv_count', existing_mvs
-            );
-
-            -- List the stale MVs
-            FOR mv_record IN
-                SELECT matviewname
-                FROM pg_matviews
-                WHERE schemaname = target_schema
-                AND matviewname LIKE template_name || '_' || target_year::text || '_%'
-                ORDER BY matviewname
-            LOOP
-                issues := issues || jsonb_build_object(
-                    'issue_type', 'STALE_MV',
-                    'severity', 'MEDIUM',
-                    'description', 'Stale MV: ' || mv_record.matviewname,
-                    'recommendation', 'DROP MATERIALIZED VIEW ' || target_schema || '.' || mv_record.matviewname
-                );
-            END LOOP;
-        ELSE
-            -- Good: Yearly table exists and no stale MVs
-            issues := issues || jsonb_build_object(
-                'issue_type', 'HEALTHY_YEARLY_TABLE',
-                'severity', 'INFO',
-                'description', 'Yearly table exists with no stale daily MVs',
-                'recommendation', 'No action needed'
-            );
-        END IF;
-    ELSE
-        -- SCENARIO 2: No yearly table, check for missing daily MVs
-        missing_mvs := expected_days - existing_mvs;
-
-        IF missing_mvs > 0 THEN
-            issues := issues || jsonb_build_object(
-                'issue_type', 'MISSING_DAILY_MVS',
-                'severity', 'MEDIUM',
-                'description', 'Missing ' || missing_mvs || ' daily MVs out of ' || expected_days || ' expected',
-                'recommendation', 'Run backfill or create yearly table from existing MVs',
-                'missing_count', missing_mvs,
-                'existing_count', existing_mvs,
-                'expected_count', expected_days
-            );
-
-            -- Check specific missing dates (sample first 10)
-            FOR check_date IN
-                SELECT generate_series(
-                    (target_year || '-01-01')::date,
-                    (target_year || '-12-31')::date,
-                    '1 day'::interval
-                )::date
-                LIMIT 10
-            LOOP
-                expected_mv_name := _wh.create_mv_name(template_name, check_date);
-                SELECT _wh.does_mv_exist(target_schema, expected_mv_name) INTO mv_exists;
-
-                IF NOT mv_exists THEN
-                    issues := issues || jsonb_build_object(
-                        'issue_type', 'MISSING_DAILY_MV',
-                        'severity', 'LOW',
-                        'description', 'Missing MV: ' || expected_mv_name,
-                        'recommendation', 'Run: SELECT _wh.update_mv_by_template(''' || template_name || ''', ''connection_name'', ''' || target_schema || ''', ''' || check_date || ''')',
-                        'missing_date', check_date
-                    );
-                END IF;
-            END LOOP;
-
-            -- Add note if we truncated the list
-            IF missing_mvs > 10 THEN
-                issues := issues || jsonb_build_object(
-                    'issue_type', 'TRUNCATED_MISSING_LIST',
-                    'severity', 'INFO',
-                    'description', 'Only showing first 10 missing MVs, ' || (missing_mvs - 10) || ' more exist',
-                    'recommendation', 'Check full year manually or run bulk backfill'
-                );
-            END IF;
-        ELSE
-            -- Good: All daily MVs present
-            IF target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN
-                -- Current year: MVs up to date
-                issues := issues || jsonb_build_object(
-                    'issue_type', 'CURRENT_YEAR_UP_TO_DATE',
-                    'severity', 'INFO',
-                    'description', 'All ' || expected_days || ' daily MVs present for current year (up to today)',
-                    'recommendation', 'No action needed - current year data is up to date'
-                );
-            ELSE
-                -- Past year: ready for yearly combination
-                issues := issues || jsonb_build_object(
-                    'issue_type', 'COMPLETE_DAILY_MVS',
-                    'severity', 'INFO',
-                    'description', 'All ' || expected_days || ' daily MVs present for year',
-                    'recommendation', 'Consider running yearly combination: SELECT _wh.create_combined_table_from_template_by_year(''' || template_name || ''', ''' || target_schema || ''', ' || target_year || ')'
-                );
-            END IF;
-        END IF;
-    END IF;
-
-    -- Build final results
-    results := jsonb_build_object(
-        'template_name', template_name,
-        'target_schema', target_schema,
-        'target_year', target_year,
-        'yearly_table_exists', yearly_table_exists,
-        'expected_days', expected_days,
-        'existing_daily_mvs', existing_mvs,
-        'missing_mvs', missing_mvs,
-        'stale_mvs', stale_mvs,
-        'total_issues', jsonb_array_length(issues),
-        'status', CASE
-            WHEN jsonb_array_length(issues) = 0 THEN 'HEALTHY'
-            WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(issues) elem WHERE elem->>'severity' = 'HIGH') THEN 'CRITICAL'
-            WHEN EXISTS (SELECT 1 FROM jsonb_array_elements(issues) elem WHERE elem->>'severity' = 'MEDIUM') THEN 'WARNING'
-            ELSE 'INFO'
-        END,
-        'issues', issues,
-        'summary', CASE
-            WHEN yearly_table_exists AND existing_mvs = 0 THEN 'Healthy: Yearly table exists, no stale MVs'
-            WHEN yearly_table_exists AND existing_mvs > 0 THEN 'Critical: Stale MVs exist with yearly table'
-            WHEN NOT yearly_table_exists AND missing_mvs = 0 AND target_year = EXTRACT(YEAR FROM _wh.current_date_utc()) THEN 'Healthy: Current year data up to date'
-            WHEN NOT yearly_table_exists AND missing_mvs = 0 THEN 'Ready: All daily MVs present, ready for yearly combination'
-            WHEN NOT yearly_table_exists AND missing_mvs > 0 THEN 'Warning: Missing ' || missing_mvs || ' daily MVs'
-            ELSE 'Unknown status'
-        END
-    );
-
-    PERFORM _wh.log_info('Data integrity check completed: ' || (results->>'status'), context);
-    RETURN results;
-
-EXCEPTION
-    WHEN OTHERS THEN
-        PERFORM _wh.log_error('Error in check_views_by_template_for_year: ' || SQLERRM, context);
-        RETURN jsonb_build_object(
-            'success', false,
-            'error', SQLERRM,
-            'template_name', template_name,
-            'target_schema', target_schema,
-            'target_year', target_year
-        );
-END;
-$function$;
-
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.check_views_by_template_for_year(text, text, integer) TO whadmin;
-
-CREATE OR REPLACE FUNCTION _wh.does_mv_exist(target_schema text, view_name text)
- RETURNS boolean
- LANGUAGE plpgsql
-AS $function$
-  BEGIN
-      RETURN EXISTS (
-          SELECT 1 FROM pg_matviews
-          WHERE schemaname = target_schema
-          AND matviewname = view_name
-      );
-  END;
-  $function$
-;
-
-ALTER FUNCTION _wh.does_mv_exist(text, text) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.does_mv_exist(text, text) TO whadmin;
-
-CREATE OR REPLACE FUNCTION _wh.get_tenant_connection_string(tenant_name text)
- RETURNS text
- LANGUAGE plpgsql
- SECURITY DEFINER
-AS $function$
-  DECLARE
-      conn_string TEXT;
-  BEGIN
-      SELECT format('host=%s port=%s dbname=%s user=%s password=%s',
-                    host, port, dbname, username, password)
-      INTO conn_string
-      FROM _wh.tenant_connections
-      WHERE tenant_connections.tenant_name = get_tenant_connection_string.tenant_name;
-
-      IF conn_string IS NULL THEN
-          RAISE EXCEPTION 'No connection found for tenant: %', tenant_name;
-      END IF;
-
-      RETURN conn_string;
-  END;
-  $function$
-;
-
-ALTER FUNCTION _wh.get_tenant_connection_string(text) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.get_tenant_connection_string(text) TO whadmin;
-
-CREATE OR REPLACE FUNCTION _wh.refresh_mv(target_schema text, view_name text)
- RETURNS boolean
- LANGUAGE plpgsql
-AS $function$
-  DECLARE
-      full_mv_name TEXT;
-      context JSONB;
-  BEGIN
-      full_mv_name := target_schema || '.' || view_name;
-      context := jsonb_build_object('schema', target_schema, 'view_name', view_name);
-
-      BEGIN
-          EXECUTE format('REFRESH MATERIALIZED VIEW %I.%I', target_schema, view_name);
-          PERFORM _wh.log_info('Successfully refreshed MV: ' || full_mv_name, context);
-          RETURN TRUE;
-      EXCEPTION
-          WHEN OTHERS THEN
-              PERFORM _wh.log_error('Failed to refresh MV ' || full_mv_name || ': ' || SQLERRM, context);
-              RETURN FALSE;
-      END;
-  END;
-  $function$
-;
-
-ALTER FUNCTION _wh.refresh_mv(text, text) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.refresh_mv(text, text) TO whadmin;
-
--- =============================================================================
--- LOGGING FUNCTIONS
--- =============================================================================
-
-CREATE OR REPLACE FUNCTION _wh.log_info(message text, context jsonb DEFAULT '{}'::jsonb)
- RETURNS void
- LANGUAGE plpgsql
-AS $function$
-  BEGIN
-      RAISE INFO '[WH][%] INFO: % %', clock_timestamp(), message, context;
-  END;
-  $function$
-;
-
-CREATE OR REPLACE FUNCTION _wh.log_error(message text, context jsonb DEFAULT '{}'::jsonb)
- RETURNS void
- LANGUAGE plpgsql
-AS $function$
-  BEGIN
-      RAISE NOTICE '[WH][%] ERROR: % %', clock_timestamp(), message, context;
-  END;
-  $function$
-;
-
-CREATE OR REPLACE FUNCTION _wh.log_debug(message text, context jsonb DEFAULT '{}'::jsonb)
- RETURNS void
- LANGUAGE plpgsql
-AS $function$
-  BEGIN
-      -- Debug messages can be commented out in production
-      RAISE DEBUG '[WH][%] DEBUG: % %', clock_timestamp(), message, context;
-  END;
-  $function$
-;
-
-ALTER FUNCTION _wh.log_info(text, jsonb) OWNER TO postgres;
-ALTER FUNCTION _wh.log_error(text, jsonb) OWNER TO postgres;
-ALTER FUNCTION _wh.log_debug(text, jsonb) OWNER TO postgres;
-GRANT EXECUTE ON FUNCTION _wh.log_info(text, jsonb) TO whadmin;
-GRANT EXECUTE ON FUNCTION _wh.log_error(text, jsonb) TO whadmin;
-GRANT EXECUTE ON FUNCTION _wh.log_debug(text, jsonb) TO whadmin;
-
--- =============================================================================
--- UNION VIEW FUNCTIONS
--- =============================================================================
-
--- Create tenant union view from template-based MVs and yearly tables
-CREATE OR REPLACE FUNCTION _wh.update_tenant_union_view_by_template(
-    template_name text,
-    target_schema text,
-    exclude_pattern text DEFAULT NULL
-)
-RETURNS boolean
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $function$
-DECLARE
-    union_sql TEXT;
-    mv_record RECORD;
-    table_record RECORD;
+    insert_sql TEXT;
+    create_sql TEXT;
+    index_sql TEXT;
+    processed_count INTEGER := 0;
+    total_records BIGINT := 0;
+    start_time TIMESTAMP := NOW();
     context JSONB;
-    view_count INTEGER := 0;
-    view_basename TEXT;
 BEGIN
-    view_basename := template_name;
+    yearly_table_name := template_name || '_' || target_year;
+    full_table_name := target_schema || '.' || yearly_table_name;
 
     context := jsonb_build_object(
         'template', template_name,
         'schema', target_schema,
-        'view_basename', view_basename,
-        'exclude_pattern', exclude_pattern
+        'year', target_year,
+        'yearly_table', yearly_table_name
     );
 
-    PERFORM _wh.log_info('Creating tenant union view for template: ' || template_name || ' in schema: ' || target_schema, context);
+    PERFORM _wh.log_info('Starting yearly combination for: ' || full_table_name, context);
 
-    -- Build UNION ALL query from all matching materialized views and yearly tables
-    union_sql := '';
+    -- Get template data
+    SELECT * INTO template_data
+    FROM _wh.mv_templates
+    WHERE mv_templates.template_name = year_table_create_from_template.template_name;
 
-    -- Add yearly tables first (pattern: template_name_YYYY)
-    FOR table_record IN
-        SELECT tablename
-        FROM pg_tables
-        WHERE schemaname = target_schema
-        AND tablename ~ ('^' || template_name || '_[0-9]{4}$')
-        ORDER BY tablename
-    LOOP
-        IF view_count > 0 THEN
-            union_sql := union_sql || ' UNION ALL ';
-        END IF;
-        union_sql := union_sql || format('SELECT * FROM %I.%I', target_schema, table_record.tablename);
-        view_count := view_count + 1;
-        PERFORM _wh.log_debug('Added yearly table to union: ' || table_record.tablename, context);
-    END LOOP;
-
-    -- Add daily materialized views (pattern: template_name_YYYY_MM_DD)
-    FOR mv_record IN
-        SELECT matviewname
-        FROM pg_matviews
-        WHERE schemaname = target_schema
-        AND matviewname LIKE template_name || '_%'
-        AND (exclude_pattern IS NULL OR matviewname NOT LIKE '%' || exclude_pattern || '%')
-        ORDER BY matviewname
-    LOOP
-        IF view_count > 0 THEN
-            union_sql := union_sql || ' UNION ALL ';
-        END IF;
-        union_sql := union_sql || format('SELECT * FROM %I.%I', target_schema, mv_record.matviewname);
-        view_count := view_count + 1;
-        PERFORM _wh.log_debug('Added daily MV to union: ' || mv_record.matviewname, context);
-    END LOOP;
-
-    IF view_count = 0 THEN
-        PERFORM _wh.log_error('No materialized views or yearly tables found for template pattern: ' || target_schema || '.' || template_name || '_*', context);
-        RETURN FALSE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Template not found: %', template_name;
     END IF;
 
-    -- Create or replace the union view (no dropping)
-    EXECUTE format('CREATE OR REPLACE VIEW %I.%I AS %s', target_schema, view_basename, union_sql);
-
-    -- Set ownership and permissions
-    EXECUTE format('ALTER VIEW %I.%I OWNER TO whadmin', target_schema, view_basename);
-    EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, view_basename);
-
-    PERFORM _wh.log_info('Successfully created tenant union view with ' || view_count || ' sources (MVs + yearly tables)', context);
-    RETURN TRUE;
-EXCEPTION
-    WHEN OTHERS THEN
-        PERFORM _wh.log_error('Failed to create tenant union view: ' || SQLERRM, context);
-        RETURN FALSE;
-END;
-$function$;
-
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.update_tenant_union_view_by_template(text, text, text) TO whadmin;
-
--- Create public master view from all tenant union views
-CREATE OR REPLACE FUNCTION _wh.update_public_view_by_template(
-    template_name text
-)
-RETURNS boolean
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $function$
-DECLARE
-    union_sql TEXT;
-    schema_record RECORD;
-    context JSONB;
-    view_count INTEGER := 0;
-    public_view_name TEXT;
-BEGIN
-    public_view_name := template_name;
-
-    context := jsonb_build_object(
-        'template', template_name,
-        'public_view_name', public_view_name
-    );
-
-    PERFORM _wh.log_info('Creating public master view for template: ' || template_name, context);
-
-    -- Build UNION ALL query from all tenant schemas that have the template view
-    union_sql := '';
-    FOR schema_record IN
-        SELECT DISTINCT schemaname
-        FROM pg_views
-        WHERE viewname = template_name
-        AND schemaname != 'public'
-        AND schemaname != '_wh'
-        AND schemaname != 'chron'
-        ORDER BY schemaname
-    LOOP
-        IF view_count > 0 THEN
-            union_sql := union_sql || ' UNION ALL ';
-        END IF;
-        union_sql := union_sql || format('SELECT *, %L AS schema_name FROM %I.%I', schema_record.schemaname, schema_record.schemaname, template_name);
-        view_count := view_count + 1;
-    END LOOP;
-
-    IF view_count = 0 THEN
-        PERFORM _wh.log_error('No tenant union views found for template: ' || template_name, context);
-        RETURN FALSE;
+    -- Check if yearly table already exists
+    IF EXISTS (SELECT 1 FROM pg_tables WHERE schemaname = target_schema AND tablename = yearly_table_name) THEN
+        RAISE EXCEPTION 'Yearly table already exists: %', full_table_name;
     END IF;
-
-    -- Create or replace the public master view (no dropping)
-    EXECUTE format('CREATE OR REPLACE VIEW public.%I AS %s', public_view_name, union_sql);
-
-    -- Set ownership and permissions
-    EXECUTE format('ALTER VIEW public.%I OWNER TO whadmin', public_view_name);
-    EXECUTE format('GRANT SELECT ON public.%I TO PUBLIC', public_view_name);
-
-    PERFORM _wh.log_info('Successfully created public master view with ' || view_count || ' tenant schemas', context);
-    RETURN TRUE;
-EXCEPTION
-    WHEN OTHERS THEN
-        PERFORM _wh.log_error('Failed to create public master view: ' || SQLERRM, context);
-        RETURN FALSE;
-END;
-$function$;
-
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.update_public_view_by_template(text) TO whadmin;
-
--- =============================================================================
--- YEARLY COMBINATION FUNCTIONS
--- =============================================================================
-
--- Create combined yearly table from daily MVs for a specific year
-CREATE OR REPLACE FUNCTION _wh.create_combined_table_from_template_by_year(
-    template_name text,
-    target_schema text,
-    target_year integer
-)
-RETURNS jsonb
-LANGUAGE plpgsql
-SECURITY DEFINER
-AS $function$
-DECLARE
-    yearly_table_name TEXT;
-    column_definitions TEXT;
-    indexes_sql TEXT;
-    mv_record RECORD;
-    context JSONB;
-    pre_count BIGINT := 0;
-    post_count BIGINT := 0;
-    processed_count INTEGER := 0;
-    inserted_count BIGINT := 0;
-    temp_inserted_count BIGINT;
-    start_time TIMESTAMP := NOW();
-    template_exists BOOLEAN := FALSE;
-    table_exists BOOLEAN := FALSE;
-    stub_sql TEXT;
-    create_sql TEXT;
-    insert_sql TEXT;
-    year_pattern TEXT;
-BEGIN
-    yearly_table_name := template_name || '_' || target_year::text;
-    year_pattern := template_name || '_' || target_year::text || '_%';
-
-    context := jsonb_build_object(
-        'template_name', template_name,
-        'target_schema', target_schema,
-        'target_year', target_year,
-        'yearly_table_name', yearly_table_name
-    );
-
-    PERFORM _wh.log_info('Starting yearly combination for template: ' || template_name || ' year: ' || target_year, context);
-
-    -- Step 1: Validate template exists
-    SELECT EXISTS (
-        SELECT 1 FROM _wh.mv_templates
-        WHERE mv_templates.template_name = create_combined_table_from_template_by_year.template_name
-    ) INTO template_exists;
-
-    IF NOT template_exists THEN
-        PERFORM _wh.log_error('Template not found: ' || template_name, context);
-        RETURN jsonb_build_object('success', false, 'error', 'Template not found: ' || template_name);
-    END IF;
-
-    -- Step 2: Check if yearly table already exists
-    SELECT EXISTS (
-        SELECT 1 FROM pg_tables
-        WHERE schemaname = target_schema
-        AND tablename = yearly_table_name
-    ) INTO table_exists;
-
-    IF table_exists THEN
-        PERFORM _wh.log_error('Yearly table already exists: ' || target_schema || '.' || yearly_table_name, context);
-        RETURN jsonb_build_object('success', false, 'error', 'Yearly table already exists: ' || target_schema || '.' || yearly_table_name);
-    END IF;
-
-    -- Step 3: Get pre-count from tenant union view (using UTC to match MV creation logic)
-    BEGIN
-        EXECUTE format('SELECT COUNT(*) FROM %I.%I WHERE EXTRACT(YEAR FROM logged_time AT TIME ZONE ''UTC'') = %s',
-                      target_schema, template_name, target_year) INTO pre_count;
-        PERFORM _wh.log_info('Pre-combination record count (UTC): ' || pre_count, context);
-    EXCEPTION
-        WHEN OTHERS THEN
-            PERFORM _wh.log_error('Failed to get pre-count from tenant union view: ' || SQLERRM, context);
-            RETURN jsonb_build_object('success', false, 'error', 'Failed to get pre-count: ' || SQLERRM);
-    END;
 
     -- Start transaction for the combination process
     BEGIN
         -- Step 4: Recreate tenant union view excluding the year we're about to combine
-        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema, '_' || target_year::text || '_') THEN
+        IF NOT _wh.union_view_update_tenant_by_template(template_name, target_schema, '_' || target_year::text || '_') THEN
             RAISE EXCEPTION 'Failed to recreate tenant union view with exclusions';
         END IF;
         PERFORM _wh.log_info('Recreated tenant union view excluding year: ' || target_year, context);
 
-        -- Step 6: Get template definitions
-        SELECT mv_templates.column_definitions, mv_templates.indexes INTO column_definitions, indexes_sql
-        FROM _wh.mv_templates
-        WHERE mv_templates.template_name = create_combined_table_from_template_by_year.template_name;
-
-        -- Step 7: Create yearly table
-        create_sql := format('CREATE TABLE %I.%I (%s)', target_schema, yearly_table_name, column_definitions);
+        -- Step 5: Create yearly table with same structure as template
+        create_sql := format('CREATE TABLE %I.%I (%s)',
+                           target_schema, yearly_table_name, template_data.column_definitions);
         EXECUTE create_sql;
-        PERFORM _wh.log_info('Created yearly table: ' || target_schema || '.' || yearly_table_name, context);
+        PERFORM _wh.log_info('Created yearly table structure: ' || full_table_name, context);
 
-        -- Step 8: Set table ownership
-        EXECUTE format('ALTER TABLE %I.%I OWNER TO whadmin', target_schema, yearly_table_name);
-        EXECUTE format('GRANT SELECT ON %I.%I TO PUBLIC', target_schema, yearly_table_name);
-
-        -- Step 9: Create indexes
-        IF indexes_sql IS NOT NULL AND trim(indexes_sql) != '' THEN
-            -- Replace placeholders in index SQL
-            indexes_sql := replace(indexes_sql, '{SCHEMA}', target_schema);
-            indexes_sql := replace(indexes_sql, '{VIEW_NAME}', yearly_table_name);
-            EXECUTE indexes_sql;
-            PERFORM _wh.log_info('Created indexes for yearly table', context);
-        END IF;
-
-        -- Step 10: Process each matching MV
+        -- Step 6: Process each daily MV and insert data
         FOR mv_record IN
             SELECT matviewname
             FROM pg_matviews
             WHERE schemaname = target_schema
-            AND matviewname LIKE year_pattern
+            AND matviewname LIKE template_name || '_' || target_year || '_%'
             ORDER BY matviewname
         LOOP
-            -- Insert data from MV into yearly table
+            -- Insert data from MV to yearly table
             insert_sql := format('INSERT INTO %I.%I SELECT * FROM %I.%I',
-                                target_schema, yearly_table_name, target_schema, mv_record.matviewname);
+                                target_schema, yearly_table_name,
+                                target_schema, mv_record.matviewname);
             EXECUTE insert_sql;
 
-            GET DIAGNOSTICS temp_inserted_count = ROW_COUNT;
-            inserted_count := inserted_count + temp_inserted_count;
-            processed_count := processed_count + 1;
+            -- Get row count and add to total
+            GET DIAGNOSTICS processed_count = ROW_COUNT;
+            total_records := total_records + processed_count;
 
-            PERFORM _wh.log_info('Inserted ' || temp_inserted_count || ' records from MV: ' || mv_record.matviewname, context);
+            PERFORM _wh.log_info('Processed MV: ' || mv_record.matviewname || ' (' || processed_count || ' records)', context);
 
-            -- Drop the materialized view
+            -- Drop the daily MV after successful data transfer
             EXECUTE format('DROP MATERIALIZED VIEW %I.%I', target_schema, mv_record.matviewname);
             PERFORM _wh.log_info('Dropped MV: ' || mv_record.matviewname, context);
+
+            processed_count := processed_count + 1;
         END LOOP;
 
+        -- Step 7: Create indexes on yearly table
+        IF template_data.indexes IS NOT NULL AND template_data.indexes != '' THEN
+            index_sql := REPLACE(template_data.indexes, '{SCHEMA}', target_schema);
+            index_sql := REPLACE(index_sql, '{VIEW_NAME}', yearly_table_name);
+            EXECUTE index_sql;
+            PERFORM _wh.log_info('Created indexes for yearly table: ' || full_table_name, context);
+        END IF;
+
         -- Step 11: Recreate tenant union view (include yearly table + remaining MVs)
-        IF NOT _wh.update_tenant_union_view_by_template(template_name, target_schema) THEN
+        IF NOT _wh.union_view_update_tenant_by_template(template_name, target_schema) THEN
             RAISE EXCEPTION 'Failed to recreate tenant union view';
         END IF;
         PERFORM _wh.log_info('Recreated tenant union view with yearly table', context);
 
-        -- Step 12: Get post-count from yearly table
-        EXECUTE format('SELECT COUNT(*) FROM %I.%I', target_schema, yearly_table_name) INTO post_count;
-        PERFORM _wh.log_info('Post-combination record count: ' || post_count, context);
-
-        -- Step 13: Verify record counts match
-        IF pre_count != post_count THEN
-            RAISE EXCEPTION 'Record count mismatch: pre_count=% post_count=%', pre_count, post_count;
-        END IF;
-
-        PERFORM _wh.log_info('Record count verification passed: ' || post_count || ' records', context);
-
-        -- Commit the transaction (implicit)
-        PERFORM _wh.log_info('Successfully completed yearly combination for ' || target_year ||
-                            ': processed ' || processed_count || ' MVs, combined ' || inserted_count || ' records', context);
+        PERFORM _wh.log_info('Successfully completed yearly combination',
+                             jsonb_build_object('yearly_table', full_table_name, 'processed_mvs', processed_count, 'total_records', total_records));
 
         RETURN jsonb_build_object(
             'success', true,
             'template_name', template_name,
+            'schema', target_schema,
             'target_year', target_year,
-            'yearly_table_name', yearly_table_name,
+            'yearly_table', yearly_table_name,
             'processed_mvs', processed_count,
-            'total_records', inserted_count,
-            'pre_count', pre_count,
-            'post_count', post_count,
+            'total_records', total_records,
             'duration_seconds', EXTRACT(EPOCH FROM (NOW() - start_time))
         );
 
@@ -1056,10 +653,402 @@ BEGIN
 END;
 $function$;
 
--- Grant execute permission to whadmin only
-GRANT EXECUTE ON FUNCTION _wh.create_combined_table_from_template_by_year(text, text, integer) TO whadmin;
+-- =============================================================================
+-- UNION VIEW MANAGEMENT
+-- =============================================================================
+
+-- Update tenant union view by template
+CREATE OR REPLACE FUNCTION _wh.union_view_update_tenant_by_template(
+    template_name text,
+    target_schema text,
+    exclude_pattern text DEFAULT ''
+)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    mv_record RECORD;
+    yearly_record RECORD;
+    union_parts TEXT[] := '{}';
+    final_query TEXT;
+    view_name TEXT;
+    context JSONB;
+BEGIN
+    view_name := template_name;
+    context := jsonb_build_object(
+        'template', template_name,
+        'schema', target_schema,
+        'view_name', view_name,
+        'exclude_pattern', exclude_pattern
+    );
+
+    PERFORM _wh.log_info('Updating tenant union view: ' || target_schema || '.' || view_name, context);
+
+    -- Add daily materialized views (excluding pattern if specified)
+    FOR mv_record IN
+        SELECT matviewname
+        FROM pg_matviews
+        WHERE schemaname = target_schema
+        AND matviewname LIKE template_name || '_%'
+        AND matviewname NOT LIKE '%' || exclude_pattern || '%'
+        ORDER BY matviewname
+    LOOP
+        union_parts := array_append(union_parts, format('SELECT * FROM %I.%I', target_schema, mv_record.matviewname));
+    END LOOP;
+
+    -- Add yearly tables
+    FOR yearly_record IN
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = target_schema
+        AND tablename ~ ('^' || template_name || '_\d{4}$')
+        ORDER BY tablename
+    LOOP
+        union_parts := array_append(union_parts, format('SELECT * FROM %I.%I', target_schema, yearly_record.tablename));
+    END LOOP;
+
+    -- Create the union view
+    IF array_length(union_parts, 1) > 0 THEN
+        final_query := format('CREATE OR REPLACE VIEW %I.%I AS %s',
+            target_schema, view_name, array_to_string(union_parts, ' UNION ALL '));
+        EXECUTE final_query;
+
+        PERFORM _wh.log_info('Successfully updated tenant union view: ' || target_schema || '.' || view_name,
+                             jsonb_build_object('template', template_name, 'union_parts', array_length(union_parts, 1)));
+        RETURN TRUE;
+    ELSE
+        PERFORM _wh.log_error('No materialized views or yearly tables found for union view',
+                              jsonb_build_object('template', template_name, 'schema', target_schema));
+        RETURN FALSE;
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM _wh.log_error('Failed to update tenant union view: ' || SQLERRM, context);
+        RETURN FALSE;
+END;
+$function$;
+
+-- Update public union view by template
+CREATE OR REPLACE FUNCTION _wh.union_view_update_public_by_template(template_name text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    schema_record RECORD;
+    union_parts TEXT[] := '{}';
+    final_query TEXT;
+    context JSONB;
+BEGIN
+    context := jsonb_build_object('template', template_name, 'operation', 'update_public_view');
+
+    PERFORM _wh.log_info('Updating public union view: public.' || template_name, context);
+
+    -- Find all schemas that have this template view
+    FOR schema_record IN
+        SELECT DISTINCT schemaname
+        FROM pg_views
+        WHERE viewname = template_name
+        AND schemaname NOT IN ('public', '_wh')
+        ORDER BY schemaname
+    LOOP
+        union_parts := array_append(union_parts, format(
+            'SELECT *, %L as schema_name FROM %I.%I',
+            schema_record.schemaname, schema_record.schemaname, template_name
+        ));
+    END LOOP;
+
+    -- Create the public union view
+    IF array_length(union_parts, 1) > 0 THEN
+        final_query := format('CREATE OR REPLACE VIEW public.%I AS %s',
+            template_name, array_to_string(union_parts, ' UNION ALL '));
+        EXECUTE final_query;
+
+        PERFORM _wh.log_info('Successfully updated public union view: public.' || template_name,
+                             jsonb_build_object('template', template_name, 'tenant_count', array_length(union_parts, 1)));
+        RETURN TRUE;
+    ELSE
+        PERFORM _wh.log_error('No tenant views found for public union view',
+                              jsonb_build_object('template', template_name));
+        RETURN FALSE;
+    END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM _wh.log_error('Failed to update public union view: ' || template_name || ' - ' || SQLERRM, context);
+        RETURN FALSE;
+END;
+$function$;
+
+-- =============================================================================
+-- CRON WRAPPER FUNCTIONS
+-- These functions provide clean interfaces for common cron job operations
+-- =============================================================================
+
+-- Daily refresh wrapper for cron jobs
+CREATE OR REPLACE FUNCTION _wh.cron_refresh_today(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text
+)
+RETURNS boolean
+LANGUAGE sql
+SECURITY DEFINER
+AS $function$
+    SELECT _wh.mv_update_by_template($1, $2, $3);
+$function$;
+
+-- Recent days refresh wrapper for cron jobs
+CREATE OR REPLACE FUNCTION _wh.cron_refresh_recent(
+    template_name text,
+    tenant_connection_name text,
+    target_schema text,
+    days_back integer
+)
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+AS $function$
+    SELECT _wh.mv_update_window_by_template($1, $2, $3, _wh.util_current_date_utc(-$4), _wh.util_current_date_utc(-1));
+$function$;
+
+-- Last year combination wrapper for cron jobs
+CREATE OR REPLACE FUNCTION _wh.cron_combine_last_year(
+    template_name text,
+    target_schema text
+)
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+AS $function$
+    SELECT _wh.year_table_create_from_template($1, $2, EXTRACT(YEAR FROM _wh.util_current_date_utc(-365))::integer);
+$function$;
+
+-- =============================================================================
+-- SCHEMA MODIFICATION FUNCTIONS
+-- These functions help with adding/modifying columns across the warehouse
+-- =============================================================================
+
+-- Drop public union view for a template
+CREATE OR REPLACE FUNCTION _wh.union_view_drop_public_by_template(template_name text)
+RETURNS boolean
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    context JSONB;
+BEGIN
+    context := jsonb_build_object('template', template_name, 'operation', 'drop_public_view');
+
+    EXECUTE format('DROP VIEW IF EXISTS public.%I CASCADE', template_name);
+    PERFORM _wh.log_info('Dropped public view: ' || template_name, context);
+    RETURN TRUE;
+EXCEPTION
+    WHEN OTHERS THEN
+        PERFORM _wh.log_error('Failed to drop public view: ' || template_name || ' - ' || SQLERRM, context);
+        RETURN FALSE;
+END;
+$function$;
+
+-- Drop all tenant union views for a template
+CREATE OR REPLACE FUNCTION _wh.union_view_drop_all_by_template(template_name text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    schema_record RECORD;
+    results jsonb := '[]';
+    success_count integer := 0;
+    error_count integer := 0;
+    context JSONB;
+BEGIN
+    context := jsonb_build_object('template', template_name, 'operation', 'drop_tenant_union_views');
+
+    FOR schema_record IN
+        SELECT DISTINCT schemaname
+        FROM pg_views
+        WHERE viewname = template_name
+        AND schemaname NOT IN ('public', '_wh')
+    LOOP
+        BEGIN
+            EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', schema_record.schemaname, template_name);
+            success_count := success_count + 1;
+            PERFORM _wh.log_info('Dropped tenant union view: ' || schema_record.schemaname || '.' || template_name, context);
+        EXCEPTION
+            WHEN OTHERS THEN
+                error_count := error_count + 1;
+                PERFORM _wh.log_error('Failed to drop tenant union view: ' || schema_record.schemaname || '.' || template_name || ' - ' || SQLERRM, context);
+        END;
+    END LOOP;
+
+    PERFORM _wh.log_info('Completed dropping tenant union views',
+                         jsonb_build_object('template', template_name, 'success_count', success_count, 'error_count', error_count));
+
+    RETURN jsonb_build_object('success_count', success_count, 'error_count', error_count);
+END;
+$function$;
+
+-- Add column to all yearly tables for a template
+CREATE OR REPLACE FUNCTION _wh.year_table_add_column_by_template(
+    template_name text,
+    column_name text,
+    column_type text,
+    default_value text DEFAULT NULL,
+    create_index boolean DEFAULT true
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    table_record RECORD;
+    success_count integer := 0;
+    error_count integer := 0;
+    alter_sql text;
+    index_sql text;
+    context JSONB;
+BEGIN
+    context := jsonb_build_object(
+        'template', template_name,
+        'operation', 'add_column_to_yearly_tables',
+        'column_name', column_name,
+        'column_type', column_type,
+        'default_value', default_value,
+        'create_index', create_index
+    );
+
+    FOR table_record IN
+        SELECT schemaname, tablename
+        FROM pg_tables
+        WHERE tablename ~ ('^' || template_name || '_\d{4}$')
+        AND schemaname NOT IN ('information_schema', 'pg_catalog', '_wh', 'public')
+        ORDER BY schemaname, tablename
+    LOOP
+        BEGIN
+            -- Build ALTER TABLE statement
+            alter_sql := format('ALTER TABLE %I.%I ADD COLUMN IF NOT EXISTS %I %s',
+                               table_record.schemaname, table_record.tablename, column_name, column_type);
+
+            IF default_value IS NOT NULL THEN
+                alter_sql := alter_sql || format(' DEFAULT %L', default_value);
+            END IF;
+
+            EXECUTE alter_sql;
+
+            -- Create index if requested
+            IF create_index THEN
+                index_sql := format('CREATE INDEX IF NOT EXISTS idx_%s_%s_%s ON %I.%I (%I)',
+                                   table_record.schemaname, table_record.tablename, column_name,
+                                   table_record.schemaname, table_record.tablename, column_name);
+                EXECUTE index_sql;
+            END IF;
+
+            success_count := success_count + 1;
+            PERFORM _wh.log_info('Added column to yearly table: ' || table_record.schemaname || '.' || table_record.tablename, context);
+        EXCEPTION
+            WHEN OTHERS THEN
+                error_count := error_count + 1;
+                PERFORM _wh.log_error('Failed to add column to: ' || table_record.schemaname || '.' || table_record.tablename || ' - ' || SQLERRM, context);
+        END;
+    END LOOP;
+
+    PERFORM _wh.log_info('Completed adding column to yearly tables',
+                         jsonb_build_object('template', template_name, 'column_name', column_name, 'success_count', success_count, 'error_count', error_count));
+
+    RETURN jsonb_build_object(
+        'success_count', success_count,
+        'error_count', error_count,
+        'column_name', column_name,
+        'column_type', column_type
+    );
+END;
+$function$;
+
+-- Drop all current year MVs for a template
+CREATE OR REPLACE FUNCTION _wh.mv_drop_current_year_by_template(
+    template_name text,
+    target_year integer DEFAULT EXTRACT(YEAR FROM _wh.util_current_date_utc())::integer
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $function$
+DECLARE
+    mv_record RECORD;
+    success_count integer := 0;
+    error_count integer := 0;
+    context JSONB;
+BEGIN
+    context := jsonb_build_object(
+        'template', template_name,
+        'operation', 'drop_current_year_mvs',
+        'target_year', target_year
+    );
+
+    FOR mv_record IN
+        SELECT schemaname, matviewname
+        FROM pg_matviews
+        WHERE matviewname LIKE template_name || '_' || target_year::text || '_%'
+        AND schemaname NOT IN ('information_schema', 'pg_catalog', '_wh', 'public')
+        ORDER BY schemaname, matviewname
+    LOOP
+        BEGIN
+            EXECUTE format('DROP MATERIALIZED VIEW %I.%I', mv_record.schemaname, mv_record.matviewname);
+            success_count := success_count + 1;
+            PERFORM _wh.log_info('Dropped current year MV: ' || mv_record.schemaname || '.' || mv_record.matviewname, context);
+        EXCEPTION
+            WHEN OTHERS THEN
+                error_count := error_count + 1;
+                PERFORM _wh.log_error('Failed to drop MV: ' || mv_record.schemaname || '.' || mv_record.matviewname || ' - ' || SQLERRM, context);
+        END;
+    END LOOP;
+
+    PERFORM _wh.log_info('Completed dropping current year MVs',
+                         jsonb_build_object('template', template_name, 'target_year', target_year, 'success_count', success_count, 'error_count', error_count));
+
+    RETURN jsonb_build_object(
+        'success_count', success_count,
+        'error_count', error_count,
+        'target_year', target_year
+    );
+END;
+$function$;
+
+
+-- =============================================================================
+-- GRANT PERMISSIONS
+-- =============================================================================
+
+-- Grant execute permissions for all functions to whadmin
+GRANT EXECUTE ON FUNCTION _wh.mv_create_name(text, date) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.util_current_date_utc(integer) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_does_exist(text, text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.util_get_tenant_connection_string(text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_refresh(text, text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.log_info(text, jsonb) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.log_error(text, jsonb) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.log_debug(text, jsonb) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_create_from_template(text, text, text, date) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_update_by_template(text, text, text, date, boolean, boolean) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_update_window_by_template(text, text, text, date, date) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.year_table_check_views_by_template(text, text, integer) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.year_table_create_from_template(text, text, integer) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.union_view_update_tenant_by_template(text, text, text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.union_view_update_public_by_template(text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.union_view_drop_public_by_template(text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.union_view_drop_all_by_template(text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.year_table_add_column_by_template(text, text, text, text, boolean) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.mv_drop_current_year_by_template(text, integer) TO whadmin;
+
+-- Grant execute permissions for cron wrapper functions
+GRANT EXECUTE ON FUNCTION _wh.cron_refresh_today(text, text, text) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.cron_refresh_recent(text, text, text, integer) TO whadmin;
+GRANT EXECUTE ON FUNCTION _wh.cron_combine_last_year(text, text) TO whadmin;
+
 
 -- =============================================================================
 -- CONNECTION MANAGEMENT
 -- =============================================================================
 -- Tenant connections managed via direct SQL INSERT/UPDATE on _wh.tenant_connections
+-- No specific functions needed - use standard SQL operations

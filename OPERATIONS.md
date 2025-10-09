@@ -229,15 +229,18 @@ select _wh.check_views_by_template_for_year(
 -- Update public master view to include new tenant
 SELECT _wh.update_public_view_by_template('foodlogstats');
 
--- Verify tenant data is included in public view
-SELECT schema_name, COUNT(*) as record_count
-FROM public.foodlogstats
-GROUP BY schema_name
-
+-- Verify tenant data is included in public view (optimized version)
+WITH counts AS (
+    SELECT
+        schema_name,
+        COUNT(*) as record_count,
+        SUM(COUNT(*)) OVER () as total_count
+    FROM public.foodlogstats
+    GROUP BY schema_name
+)
+SELECT schema_name, record_count FROM counts
 UNION ALL
-
-SELECT 'TOTAL' as schema_name, COUNT(*) as record_count
-FROM public.foodlogstats;
+SELECT 'TOTAL', MAX(total_count) FROM counts;
 ```
 
 ### Step 6: Convert Completed Years to Yearly Tables (Optional)
@@ -313,6 +316,8 @@ ORDER BY year;
 
 Add the new tenant to the automated cron job schedule by updating `sql/cron.sql` and running the new cron commands.
 
+**Note**: As of 2024, new **cron wrapper functions** provide cleaner syntax for job creation. Use these for all new tenants.
+
 #### Add to Hourly Update Block
 Edit `sql/cron.sql` and add to the "DAILY MV UPDATE JOBS" section. **Space out the minutes** to avoid overloading the database:
 
@@ -320,11 +325,11 @@ Edit `sql/cron.sql` and add to the "DAILY MV UPDATE JOBS" section. **Space out t
 -- Current pattern: LandB at :10, MM at :11
 -- Add new tenant at next available minute (e.g., :12)
 
--- NewTenant: Every 1 hour at :12
+-- NewTenant: Every 1 hour at :12 (using new cron wrapper)
 SELECT cron.schedule(
     'foodlogstats_update_newtenant',
     '12 * * * *',
-    'SELECT _wh.update_mv_by_template(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'', _wh.current_date_utc());'
+    'SELECT _wh.cron_refresh_today(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'');'
 );
 ```
 
@@ -335,11 +340,11 @@ Add to the "NIGHTLY 2-WEEK MV REFRESH JOBS" section. **Stagger the timing** by 2
 -- Current pattern: LandB at 8:30 UTC, MM at 8:32 UTC
 -- Add new tenant at next available time (e.g., 8:34 UTC)
 
--- NewTenant: Daily at 3:34 AM (Central) That's 8:34 AM UTC
+-- NewTenant: Daily at 3:34 AM (Central) That's 8:34 AM UTC (using new cron wrapper)
 SELECT cron.schedule(
     'newtenant_2week_refresh',
     '34 8 * * *',
-    'SELECT _wh.update_mv_window_by_template(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'', _wh.current_date_utc() - INTERVAL ''14 days'', _wh.current_date_utc() - INTERVAL ''1 day'');'
+    'SELECT _wh.cron_refresh_recent(''foodlogstats'', ''new_tenant_connection_name'', ''new_tenant_name'', 14);'
 );
 ```
 
@@ -350,11 +355,11 @@ Add to the "YEARLY COMBINATION JOBS" section. **Space out by 10+ minutes** due t
 -- Current pattern: LandB at 7:00 UTC, MM at 7:10 UTC
 -- Add new tenant at next available time (e.g., 7:20 UTC)
 
--- NewTenant: February 15th at 2:20 AM (CENTRAL) 7:20 AM UTC
+-- NewTenant: February 15th at 2:20 AM (CENTRAL) 7:20 AM UTC (using new cron wrapper)
 SELECT cron.schedule(
     'yearly_combination_newtenant',
     '20 7 15 2 *',
-    'SELECT _wh.create_combined_table_from_template_by_year(''foodlogstats'', ''new_tenant_name'', EXTRACT(YEAR FROM _wh.current_date_utc() - INTERVAL ''1 year'')::integer);'
+    'SELECT _wh.cron_combine_last_year(''foodlogstats'', ''new_tenant_name'');'
 );
 ```
 
@@ -646,11 +651,18 @@ WHERE tenant_name = 'tenant_connection_name';
 -- Test that public view still works
 SELECT COUNT(*) FROM public.foodlogstats;
 
--- Verify which tenants are still included
-SELECT schema_name, COUNT(*) as record_count
-FROM public.foodlogstats
-GROUP BY schema_name
-ORDER BY schema_name;
+-- Verify which tenants are still included (optimized version)
+WITH counts AS (
+    SELECT
+        schema_name,
+        COUNT(*) as record_count,
+        SUM(COUNT(*)) OVER () as total_count
+    FROM public.foodlogstats
+    GROUP BY schema_name
+)
+SELECT schema_name, record_count FROM counts
+UNION ALL
+SELECT 'TOTAL', MAX(total_count) FROM counts;
 ```
 
 ### Step 4: Clean Up Permissions
@@ -1320,11 +1332,21 @@ ORDER BY r.start_time DESC;
 ### Add a New Daily Job
 ```sql
 -- Example: Daily update for a tenant (run as whadmin user)
+-- Using new cron wrapper functions (recommended)
 SELECT cron.schedule(
     'daily-tenant-a-update',           -- job name
     '0 2 * * *',                      -- schedule (2 AM daily)
-    $$SELECT _wh.update_foodlogstats('tenant_a_conn', 'tenant_a', CURRENT_DATE);$$,
-    'phood_warehouse',                 -- database name
+    $$SELECT _wh.cron_refresh_today('foodlogstats', 'tenant_a_conn', 'tenant_a');$$,
+    'postgres',                        -- database name
+    'whadmin'                          -- username
+);
+
+-- Legacy approach (still works)
+SELECT cron.schedule(
+    'daily-tenant-a-update-legacy',
+    '0 2 * * *',                      -- schedule (2 AM daily)
+    $$SELECT _wh.mv_update_by_template('foodlogstats', 'tenant_a_conn', 'tenant_a');$$,
+    'postgres',                        -- database name
     'whadmin'                          -- username
 );
 ```
@@ -1332,11 +1354,36 @@ SELECT cron.schedule(
 ### Add a New Hourly Job
 ```sql
 -- Example: Hourly refresh of current day
+-- Using new cron wrapper functions (recommended)
 SELECT cron.schedule(
     'hourly-current-day-refresh',
     '0 * * * *',                      -- every hour
-    $$SELECT _wh.update_foodlogstats('tenant_a_conn', 'tenant_a', CURRENT_DATE);$$,
-    'phood_warehouse',                 -- database name
+    $$SELECT _wh.cron_refresh_today('foodlogstats', 'tenant_a_conn', 'tenant_a');$$,
+    'postgres',                        -- database name
+    'whadmin'                          -- username
+);
+```
+
+### Add a Recent Data Refresh Job
+```sql
+-- Example: Nightly refresh of last 14 days (using new cron wrapper)
+SELECT cron.schedule(
+    'nightly-2week-refresh',
+    '30 3 * * *',                     -- 3:30 AM daily
+    $$SELECT _wh.cron_refresh_recent('foodlogstats', 'tenant_a_conn', 'tenant_a', 14);$$,
+    'postgres',                        -- database name
+    'whadmin'                          -- username
+);
+```
+
+### Add a Yearly Combination Job
+```sql
+-- Example: Annual yearly table creation (using new cron wrapper)
+SELECT cron.schedule(
+    'yearly-combination-tenant-a',
+    '0 7 15 2 *',                     -- February 15th at 7 AM UTC
+    $$SELECT _wh.cron_combine_last_year('foodlogstats', 'tenant_a');$$,
+    'postgres',                        -- database name
     'whadmin'                          -- username
 );
 ```
