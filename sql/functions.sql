@@ -661,7 +661,7 @@ $function$;
 CREATE OR REPLACE FUNCTION _wh.union_view_update_tenant_by_template(
     template_name text,
     target_schema text,
-    exclude_pattern text DEFAULT ''
+    exclude_pattern text DEFAULT '__NEVER_MATCH_STUB__'
 )
 RETURNS boolean
 LANGUAGE plpgsql
