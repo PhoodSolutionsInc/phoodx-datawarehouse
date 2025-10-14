@@ -146,15 +146,17 @@ CREATE SCHEMA new_tenant_name;
 -- Grant operational access to whadmin user
 GRANT ALL PRIVILEGES ON SCHEMA new_tenant_name TO whadmin;
 GRANT ALL ON ALL TABLES IN SCHEMA new_tenant_name TO whadmin;
-GRANT ALL ON ALL MATERIALIZED VIEWS IN SCHEMA new_tenant_name TO whadmin;
 ALTER DEFAULT PRIVILEGES IN SCHEMA new_tenant_name GRANT ALL ON TABLES TO whadmin;
-ALTER DEFAULT PRIVILEGES IN SCHEMA new_tenant_name GRANT ALL ON VIEWS TO whadmin;
 
--- Grant read access to phood_ro user
+-- Grant read access to phood_ro user (BI reporting)
 GRANT USAGE ON SCHEMA new_tenant_name TO phood_ro;
 GRANT SELECT ON ALL TABLES IN SCHEMA new_tenant_name TO phood_ro;
-GRANT SELECT ON ALL MATERIALIZED VIEWS IN SCHEMA new_tenant_name TO phood_ro;
 ALTER DEFAULT PRIVILEGES IN SCHEMA new_tenant_name GRANT SELECT ON TABLES TO phood_ro;
+
+-- Grant read access to phood_rw user (BI analysis and custom tables)
+GRANT USAGE ON SCHEMA new_tenant_name TO phood_rw;
+GRANT SELECT ON ALL TABLES IN SCHEMA new_tenant_name TO phood_rw;
+ALTER DEFAULT PRIVILEGES IN SCHEMA new_tenant_name GRANT SELECT ON TABLES TO phood_rw;
 ```
 
 ### Step 2: Add Tenant Connection
@@ -241,6 +243,17 @@ WITH counts AS (
 SELECT schema_name, record_count FROM counts
 UNION ALL
 SELECT 'TOTAL', MAX(total_count) FROM counts;
+
+-- Verify permissions are correctly set for the new tenant schema
+-- Check that both phood_ro and phood_rw users have access
+SELECT
+    grantee,
+    privilege_type,
+    is_grantable
+FROM information_schema.schema_privileges
+WHERE schema_name = 'new_tenant_name'
+AND grantee IN ('phood_ro', 'phood_rw', 'whadmin')
+ORDER BY grantee, privilege_type;
 ```
 
 ### Step 6: Convert Completed Years to Yearly Tables (Optional)
@@ -861,7 +874,16 @@ If the operation fails:
 # Connect as phood_ro user for read-only access
 psql -h your-warehouse.rds.amazonaws.com \
      -U phood_ro \
-     -d phood_warehouse \
+     -d postgres \
+     -p 5432
+```
+
+#### For BI Analysis (Read-Write Access to Custom Schema)
+```bash
+# Connect as phood_rw user for custom table/view creation
+psql -h your-warehouse.rds.amazonaws.com \
+     -U phood_rw \
+     -d postgres \
      -p 5432
 ```
 
@@ -870,7 +892,7 @@ psql -h your-warehouse.rds.amazonaws.com \
 # Connect as whadmin user for warehouse management
 psql -h your-warehouse.rds.amazonaws.com \
      -U whadmin \
-     -d phood_warehouse \
+     -d postgres \
      -p 5432
 ```
 
@@ -894,18 +916,36 @@ GROUP BY client;
 ```
 
 ### Business Intelligence Tools
+
+#### For Read-Only Reporting (phood_ro)
 Configure these tools with the `phood_ro` credentials:
 - **Host**: your-warehouse.rds.amazonaws.com
 - **Port**: 5432
-- **Database**: phood_warehouse
+- **Database**: postgres
 - **Username**: phood_ro
 - **Password**: [your secure password]
+
+#### For Custom Analysis with Table Creation (phood_rw)
+Configure these tools with the `phood_rw` credentials:
+- **Host**: your-warehouse.rds.amazonaws.com
+- **Port**: 5432
+- **Database**: postgres
+- **Username**: phood_rw
+- **Password**: [your secure password]
+- **Default Schema**: phood (for creating custom tables/views)
+
+**phood_rw User Capabilities:**
+- Create custom tables and views in `phood` schema
+- Read access to all tenant schemas for joins
+- Read access to public union views
+- No access to operational `_wh` schema
 
 Supported tools:
 - **Tableau**: Use PostgreSQL connector
 - **Power BI**: Use PostgreSQL connector
 - **Grafana**: Add PostgreSQL data source
 - **Custom Apps**: Use any PostgreSQL client library
+- **DBeaver**: Full SQL development environment
 
 ### Performance Tips
 - Always use date filters when possible

@@ -101,8 +101,16 @@ whadmin: NOSUPERUSER, CREATEDB, CREATEROLE
 -- Read-only BI user
 phood_ro: NOSUPERUSER, NOCREATEDB, NOCREATEROLE
 - SELECT access to all tenant schemas and public views
+- SELECT access to phood schema for custom analysis tables
 - Used by BI tools and reporting applications
 - Cannot see operational schemas or connection details
+
+-- BI analyst user (custom analysis)
+phood_rw: NOSUPERUSER, NOCREATEDB, NOCREATEROLE
+- SELECT access to all tenant schemas and public views
+- CREATE access limited to phood schema only
+- Used for custom table creation and advanced analysis
+- Cannot access operational _wh schema
 ```
 
 ### Schema Organization
@@ -154,10 +162,21 @@ _wh.current_date_utc()
 -- Tenant union view (combines daily MVs + yearly tables)
 {tenant}.{template}
 └── foodlogstats             -- UNION ALL view
-    ├── SELECT * FROM foodlogstats_2023
-    ├── UNION ALL SELECT * FROM foodlogstats_2024_01_01
-    ├── UNION ALL SELECT * FROM foodlogstats_2024_01_02
-    └── ...
+```
+
+#### `phood` Schema (BI Analysis Workspace)
+```sql
+-- Custom tables and views created by BI analysts
+phood.custom_analysis_table_1
+phood.custom_analysis_table_2
+phood.custom_dashboard_view
+phood.tenant_comparison_view
+-- etc.
+
+-- Permissions:
+-- phood_rw: Full CREATE/DROP/ALTER access
+-- phood_ro: SELECT access only
+-- whadmin:  Full administrative access
 ```
 
 #### `public` Schema (BI/Reporting)

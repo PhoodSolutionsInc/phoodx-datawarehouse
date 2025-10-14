@@ -48,9 +48,19 @@ CREATE USER phood_ro WITH
     NOCREATEROLE
     LOGIN;
 
+-- Create BI read-write user for custom analysis
+-- TODO: Replace 'STUB_PHOOD_RW_PASSWORD' with actual secure password
+CREATE USER phood_rw WITH
+    PASSWORD 'STUB_PHOOD_RW_PASSWORD'
+    NOSUPERUSER
+    NOCREATEDB
+    NOCREATEROLE
+    LOGIN;
+
 -- Add comments for documentation
 COMMENT ON ROLE whadmin IS 'Warehouse administrator - manages data warehouse operations and schema';
 COMMENT ON ROLE phood_ro IS 'Read-only access for BI tools, reporting, and analytics';
+COMMENT ON ROLE phood_rw IS 'BI analyst user - read/write access to phood schema, read access to tenant data';
 
 -- =============================================================================
 -- DATABASE-LEVEL PERMISSIONS
@@ -59,6 +69,7 @@ COMMENT ON ROLE phood_ro IS 'Read-only access for BI tools, reporting, and analy
 -- Grant database connection privileges
 GRANT CONNECT ON DATABASE postgres TO whadmin;
 GRANT CONNECT ON DATABASE postgres TO phood_ro;
+GRANT CONNECT ON DATABASE postgres TO phood_rw;
 
 -- Grant schema creation privileges to whadmin (for tenant schemas)
 GRANT CREATE ON DATABASE postgres TO whadmin;
@@ -83,6 +94,36 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO phood_ro;
 -- Set default privileges for future objects in public schema
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO phood_ro;
 
+-- =============================================================================
+-- PHOOD COMMON SCHEMA SETUP
+-- =============================================================================
+
+-- Create shared BI workspace schema
+CREATE SCHEMA phood AUTHORIZATION postgres;
+
+-- Grant phood_rw full access to phood schema
+GRANT USAGE ON SCHEMA phood TO phood_rw;
+GRANT CREATE ON SCHEMA phood TO phood_rw;
+GRANT ALL ON SCHEMA phood TO phood_rw;
+
+-- Grant whadmin full access to phood schema
+GRANT USAGE ON SCHEMA phood TO whadmin;
+GRANT ALL ON SCHEMA phood TO whadmin;
+
+-- Grant phood_ro read access to phood schema
+GRANT USAGE ON SCHEMA phood TO phood_ro;
+GRANT SELECT ON ALL TABLES IN SCHEMA phood TO phood_ro;
+
+-- Grant phood_rw read access to public schema (for union views)
+GRANT USAGE ON SCHEMA public TO phood_rw;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO phood_rw;
+
+-- Set default privileges for future objects in phood schema
+-- Ensure phood_ro gets read access to all new objects
+ALTER DEFAULT PRIVILEGES IN SCHEMA phood GRANT SELECT ON TABLES TO phood_ro;
+
+-- Ensure phood_rw gets read access to future public objects
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO phood_rw;
 
 -- =============================================================================
 -- PG_CRON PERMISSIONS SETUP
@@ -138,6 +179,10 @@ ALTER TABLE _wh.mv_templates OWNER TO postgres;
 GRANT ALL ON TABLE _wh.mv_templates TO postgres;
 GRANT ALL ON TABLE _wh.mv_templates TO whadmin;
 
+-- Grant _wh schema permissions to whadmin (explicit access)
+GRANT USAGE ON SCHEMA _wh TO whadmin;
+GRANT ALL ON SCHEMA _wh TO whadmin;
+
 -- =============================================================================
 -- SECURITY CLEANUP
 -- =============================================================================
@@ -159,7 +204,7 @@ SELECT
     rolcanlogin,
     rolconnlimit
 FROM pg_roles
-WHERE rolname IN ('whadmin', 'phood_ro', 'postgres')
+WHERE rolname IN ('whadmin', 'phood_ro', 'phood_rw', 'postgres')
 ORDER BY rolname;
 
 -- Display available extensions

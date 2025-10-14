@@ -277,11 +277,26 @@ FROM pg_stat_database WHERE datname = 'warehouse';
   - ✅ **CAN**: Read all MV data across tenant and public schemas
   - ✅ **CAN**: View MV structure (columns, indexes, refresh times)
   - ✅ **CAN**: See union view definitions
+  - ✅ **CAN**: Read custom analysis tables in `phood` schema
   - ❌ **CANNOT**: Access `_wh` schema (connections, templates, functions)
   - ❌ **CANNOT**: See source queries or connection strings
   - ❌ **CANNOT**: View proprietary business logic in templates
+  - ❌ **CANNOT**: Create or modify any data
 - **Usage**: BI tools, dashboards, ad-hoc analysis
 - **Security**: Complete isolation from operational data and credentials
+
+#### `phood_rw` (BI Analyst User)
+- **Purpose**: Custom data analysis, table creation, and advanced BI development
+- **Access**:
+  - ✅ **CAN**: Read all MV data across tenant and public schemas (same as phood_ro)
+  - ✅ **CAN**: Create tables and views in `phood` schema
+  - ✅ **CAN**: Join tenant data for custom analysis
+  - ✅ **CAN**: Build complex analytical datasets
+  - ❌ **CANNOT**: Access `_wh` schema (connections, templates, functions)
+  - ❌ **CANNOT**: Modify tenant schemas or existing warehouse data
+  - ❌ **CANNOT**: Create objects outside of `phood` schema
+- **Usage**: Custom analysis, data preparation, advanced BI development
+- **Security**: Write access limited to dedicated `phood` schema only
 
 ### Schema-Level Security
 ```sql
